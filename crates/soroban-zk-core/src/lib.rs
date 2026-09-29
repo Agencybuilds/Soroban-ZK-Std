@@ -379,6 +379,7 @@ pub mod elgamal {
 
 pub use elgamal::ElGamalCiphertext;
 pub mod halo2;
+pub mod halo2_ipa;
 pub mod polynomial;
 pub use polynomial::{DensePolynomial, SparsePolynomial};
 
