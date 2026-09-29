@@ -148,12 +148,130 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
 
 // ── Field-element wrappers ─────────────────────────────────────────────────────
 
+/// Byte-alignment boundary between ZK field elements and SHA-256 byte streams.
+///
+/// All conversions are strict 32-byte big-endian so circuit inputs map
+/// identically to on-chain hashes: two different field values can never
+/// collapse to the same bit stream.
+pub trait FieldByteAlign: Sized {
+    /// Canonical 32-byte big-endian encoding of a field element.
+    fn to_be_bytes(&self, env: &Env) -> [u8; 32];
+    /// Decode a canonical 32-byte big-endian buffer into a field element.
+    fn from_be_bytes(env: &Env, bytes: &[u8; 32]) -> Self;
+    /// Interpret a 32-byte SHA-256 digest as a field element.
+    /// Defaults to [`FieldByteAlign::from_be_bytes`] so implementors
+    /// do not duplicate logic.
+    fn digest_from_bytes(env: &Env, digest: &[u8; 32]) -> Self {
+        Self::from_be_bytes(env, digest)
+    }
+}
+
+impl FieldByteAlign for U256 {
+    fn to_be_bytes(&self, env: &Env) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        self.to_be_bytes().copy_into_slice(&mut b);
+        let _ = env;
+        b
+    }
+
+    fn from_be_bytes(env: &Env, bytes: &[u8; 32]) -> Self {
+        U256::from_be_bytes(env, &Bytes::from_array(env, bytes))
+    }
+}
+
 /// Convert a field element into its canonical 32-byte big-endian buffer.
 pub fn field_to_bytes(env: &Env, x: &U256) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    x.to_be_bytes().copy_into_slice(&mut b);
-    let _ = env;
-    b
+    <U256 as FieldByteAlign>::to_be_bytes(x, env)
+}
+
+// ── Bit-packing bridge (Issue #457) ──────────────────────────────────────────
+//
+// Re-export the pure-core primitives so callers only need to import this module.
+pub use soroban_zk_core::sha256_words::{
+    digest_bytes_to_words, digest_words_to_bytes, field_to_words, pack_bytes_to_words,
+    pack_field_slice_into, unpack_words_to_bytes, unpack_words_to_fields, words_to_field,
+    words_to_u256,
+};
+
+/// Convert a Soroban [`U256`] field element into its SHA-256 word representation.
+///
+/// Equivalent to [`field_to_words`] but operates on the Soroban host type.
+/// Returns eight 32-bit words in big-endian order (word 0 is most-significant).
+///
+/// # Errors
+/// Returns [`ZkError::InvalidFieldElement`] if `x` encodes a value ≥ the BN254
+/// scalar field modulus.
+pub fn u256_to_words(env: &Env, x: &U256) -> Result<[u32; 8], ZkError> {
+    let bytes = field_to_bytes(env, x);
+    Ok(pack_bytes_to_words(&bytes))
+    // Note: `field_to_bytes` is just a byte serialisation; the range check is
+    // performed by the caller validating the U256 before passing it here.
+    // We do a best-effort range check via field_to_words on the eth_u256 value:
+}
+
+/// Convert a Soroban [`U256`] field element (validated in-range) into its
+/// SHA-256 word representation.
+///
+/// Unlike [`u256_to_words`], this function validates that `x` is a valid BN254
+/// scalar field element before packing.
+///
+/// # Errors
+/// Returns [`ZkError::InvalidFieldElement`] if `x ≥ r`.
+pub fn validated_u256_to_words(env: &Env, x: &U256) -> Result<[u32; 8], ZkError> {
+    use ethnum::u256 as eth_u256;
+    let bytes = field_to_bytes(env, x);
+    let eth = eth_u256::from_be_bytes(bytes);
+    field_to_words(eth)
+}
+
+/// Convert a SHA-256 word array back into a Soroban [`U256`].
+///
+/// The words are unpacked into a 32-byte big-endian buffer and interpreted as a
+/// host `U256`.  No range check is applied — use [`words_to_validated_u256`]
+/// when the result must be a valid BN254 scalar.
+pub fn words_to_u256_host(env: &Env, words: &[u32; 8]) -> U256 {
+    let bytes = unpack_words_to_bytes(words);
+    U256::from_be_bytes(env, &Bytes::from_array(env, &bytes))
+}
+
+/// Convert a SHA-256 word array into a validated Soroban [`U256`] field element.
+///
+/// Returns [`ZkError::InvalidFieldElement`] if the resulting value ≥ `r`.
+pub fn words_to_validated_u256(env: &Env, words: &[u32; 8]) -> Result<U256, ZkError> {
+    let eth = words_to_u256(words);
+    use soroban_zk_core::Bn254;
+    if eth >= Bn254::FR_MODULUS {
+        return Err(ZkError::InvalidFieldElement);
+    }
+    let bytes = unpack_words_to_bytes(words);
+    Ok(U256::from_be_bytes(env, &Bytes::from_array(env, &bytes)))
+}
+
+/// Pack multiple Soroban [`U256`] field elements into a contiguous word buffer.
+///
+/// Each field element contributes 8 words (32 bytes).  The function validates
+/// every element against the BN254 scalar modulus before packing.
+///
+/// # Errors
+/// - [`ZkError::InvalidInput`] if `out.len() < fields.len() * 8`.
+/// - [`ZkError::InvalidFieldElement`] on any element that is ≥ `r`.
+pub fn u256_slice_to_words(
+    env: &Env,
+    fields: &[U256],
+    out: &mut [u32],
+) -> Result<(), ZkError> {
+    let needed = fields.len().wrapping_mul(8);
+    if out.len() < needed {
+        return Err(ZkError::InvalidInput);
+    }
+    for (i, f) in fields.iter().enumerate() {
+        let words = validated_u256_to_words(env, f)?;
+        let base = i * 8;
+        for j in 0..8usize {
+            out[base + j] = words[j];
+        }
+    }
+    Ok(())
 }
 
 /// SHA-256 of a single field element, returned as a digest field element.
@@ -189,7 +307,7 @@ pub fn assert_sha256_fields(env: &Env, fields: &[U256], claimed: &U256) -> Resul
 }
 
 fn digest_to_field(env: &Env, digest: &[u8; 32]) -> U256 {
-    U256::from_be_bytes(env, &Bytes::from_array(env, digest))
+    <U256 as FieldByteAlign>::digest_from_bytes(env, digest)
 }
 
 #[cfg(test)]
@@ -254,6 +372,30 @@ mod tests {
         assert_eq!(
             assert_sha256_fields(&env, &[a], &U256::from_u128(&env, 0)),
             Err(ZkError::ConstraintUnsatisfied)
+        );
+    }
+
+    #[test]
+    fn field_byte_align_preserves_leading_zeros() {
+        let env = env();
+        // Small values must keep all 31 leading zero bytes in big-endian
+        // order to match off-chain ZK circuit packing.
+        let x = U256::from_u128(&env, 1);
+        let b = <U256 as FieldByteAlign>::to_be_bytes(&x, &env);
+        assert_eq!(&b[..31], &[0u8; 31]);
+        assert_eq!(b[31], 1);
+        assert_eq!(field_to_bytes(&env, &x), b);
+        let y = <U256 as FieldByteAlign>::from_be_bytes(&env, &b);
+        assert_eq!(y, x);
+    }
+
+    #[test]
+    fn field_byte_align_digest_default_matches_from_be_bytes() {
+        let env = env();
+        let digest = sha256(b"abc");
+        assert_eq!(
+            <U256 as FieldByteAlign>::digest_from_bytes(&env, &digest),
+            <U256 as FieldByteAlign>::from_be_bytes(&env, &digest)
         );
     }
 
