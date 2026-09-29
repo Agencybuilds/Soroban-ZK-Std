@@ -128,6 +128,15 @@ struct Transcript {
     sponge: poseidon2::Poseidon2Sponge,
 }
 
+fn nonzero_challenge(mut squeeze: impl FnMut() -> u256) -> u256 {
+    loop {
+        let challenge = squeeze();
+        if challenge != u256::from(0u8) {
+            return challenge;
+        }
+    }
+}
+
 impl Transcript {
     fn new() -> Self {
         Self {
@@ -144,9 +153,9 @@ impl Transcript {
         self.sponge.absorb(&[p.x, p.y]);
     }
 
-    /// Produce the next challenge scalar in `[0, r)`.
+    /// Produce the next non-zero challenge scalar in `[1, r)`.
     fn challenge(&mut self) -> u256 {
-        self.sponge.squeeze()
+        nonzero_challenge(|| self.sponge.squeeze())
     }
 }
 
@@ -807,6 +816,15 @@ mod tests {
         p = add_scaled(p, &q, ab);
         let proof = ipa_prove(p.to_affine(), g.g, g.h, a, b, &q);
         assert!(ipa_verify(p.to_affine(), g.g, g.h, &q, &proof));
+    }
+
+    #[test]
+    fn transcript_retries_zero_challenges() {
+        let mut challenges = [u256::from(0u8), u256::from(7u8)].into_iter();
+        assert_eq!(
+            nonzero_challenge(|| challenges.next().unwrap()),
+            u256::from(7u8)
+        );
     }
 
     #[test]
