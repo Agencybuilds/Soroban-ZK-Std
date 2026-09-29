@@ -10,11 +10,13 @@ pub mod nullifier;
 pub mod pairing;
 pub mod poseidon2;
 pub mod rescue_prime;
+pub mod telemetry;
 pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 pub use halo2::{Halo2StorageKey, LookupTable, PermutationKey};
 pub use pairing::{pairing_check, G2Affine};
+pub use telemetry::{emit_verification_event, estimate_cycle_cost, ProofType, VerificationEvent};
 pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
     vk_to_bytes, G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey, VkMeta, VkStorageKey,
@@ -272,6 +274,22 @@ impl ZkContract {
                 nstore.mark_spent(&env, &proof_bytes, &inputs_buf)
                     .map_err(|_| ZkContractError::StorageError)?;
             }
+        }
+
+        // ── Emit telemetry event on successful verification ────────────────────
+        //
+        // Only emit after a confirmed Ok(true) result so that the event
+        // ledger reliably represents accepted proofs only.  The Groth16
+        // verifier always uses exactly 4 pairing pairs (e(A,B), e(−α,β),
+        // e(−acc,γ), e(−C,δ)) regardless of public input count.
+        if let Ok(true) = result {
+            telemetry::emit_verification_event(
+                &env,
+                telemetry::ProofType::Groth16,
+                public_inputs.len() as u32,
+                // Standard Groth16 equation: A·B, α·β, acc·γ, C·δ = 4 pairs
+                4,
+            );
         }
 
         result.map_err(ZkContractError::from)

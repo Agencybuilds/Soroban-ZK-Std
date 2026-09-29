@@ -5,6 +5,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
 use soroban_zk_core::G1Affine;
 use soroban_zk_std::groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 use soroban_zk_std::pairing::G2Affine;
+use soroban_zk_std::telemetry::{emit_verification_event, ProofType};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +63,11 @@ impl ShieldedAsset {
 
         // 5. ZK Proof passed! Update the encrypted balances via Homomorphic Addition
         // (Implementation of homomorphic addition omitted for brevity in this template)
+
+        // Emit structured telemetry so indexers and network monitors can track
+        // verification load.  Groth16 always uses 4 pairing pairs; we had 1
+        // public input parsed above.
+        emit_verification_event(&env, ProofType::Groth16, 1, 4);
 
         // Example event emission to notify watchers
         #[allow(deprecated)]
