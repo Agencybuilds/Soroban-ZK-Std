@@ -572,6 +572,44 @@ impl Halo2Domain {
         // Subtract 1 using field subtraction to handle the wrap-around.
         Bn254::sub(result, u256::from(1u8))
     }
+
+    /// Evaluates the degree-`< n` parts of a split quotient polynomial at `zeta`.
+    ///
+    /// For `t(X) = Σ parts[i](X) · X^(i·n)`, returns
+    /// `t(zeta) = Σ parts[i](zeta) · (zeta^n)^i`.
+    pub fn evaluate_quotient_parts(&self, parts: &[&[u256]], zeta: u256) -> Result<u256, ZkError> {
+        self.validate()?;
+        if parts.is_empty() {
+            return Err(ZkError::InvalidInput);
+        }
+        if zeta >= Bn254::FR_MODULUS {
+            return Err(ZkError::InvalidFieldElement);
+        }
+
+        let mut zeta_n_power = u256::from(1u8);
+        let zeta_n = Bn254::pow(zeta, u256::from(self.n));
+        let mut quotient_value = u256::from(0u8);
+        for part in parts {
+            if part.len() as u64 > self.n {
+                return Err(ZkError::InvalidInput);
+            }
+
+            let mut part_value = u256::from(0u8);
+            for coefficient in part.iter().rev() {
+                if *coefficient >= Bn254::FR_MODULUS {
+                    return Err(ZkError::InvalidFieldElement);
+                }
+                part_value = Bn254::add(Bn254::mul(part_value, zeta), *coefficient);
+            }
+            quotient_value = Bn254::add(
+                quotient_value,
+                Bn254::mul(part_value, zeta_n_power),
+            );
+            zeta_n_power = Bn254::mul(zeta_n_power, zeta_n);
+        }
+
+        Ok(quotient_value)
+    }
 }
 
 /// The complete Halo2 verification key, combining domain parameters, KZG
@@ -1022,6 +1060,30 @@ mod tests {
         let domain = Halo2Domain { k: 1, n: 2, omega: u256::from(3u8) };
         let result = domain.evaluate_vanishing(u256::from(2u8));
         assert_eq!(result, u256::from(3u8));
+    }
+
+    #[test]
+    fn quotient_parts_are_combined_with_zeta_to_domain_size() {
+        let domain = Halo2Domain { k: 1, n: 2, omega: u256::from(3u8) };
+        let first = [u256::from(1u8), u256::from(2u8)];
+        let second = [u256::from(3u8), u256::from(4u8)];
+
+        // (1 + 2·5) + 5²·(3 + 4·5) = 586.
+        assert_eq!(
+            domain.evaluate_quotient_parts(&[&first, &second], u256::from(5u8)),
+            Ok(u256::from(586u16)),
+        );
+    }
+
+    #[test]
+    fn quotient_part_larger_than_domain_is_rejected() {
+        let domain = Halo2Domain { k: 1, n: 2, omega: u256::from(3u8) };
+        let oversized = [u256::from(1u8), u256::from(2u8), u256::from(3u8)];
+
+        assert_eq!(
+            domain.evaluate_quotient_parts(&[&oversized], u256::from(5u8)),
+            Err(ZkError::InvalidInput),
+        );
     }
 
     // --- Halo2Params ---
