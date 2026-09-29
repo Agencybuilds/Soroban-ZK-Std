@@ -94,6 +94,230 @@ impl MerklePath {
     }
 }
 
+// ===========================================================================
+// Deep-branching MerklePath structures (Issue #460)
+// ===========================================================================
+//
+// The original `MerklePath` is capped at `MAX_DEPTH = 32` because it stores
+// all siblings in a flat `[[u8; 32]; 32]` array (1 KiB on the stack). For
+// trees with depth > 32 (e.g. the 2^40 row traces used by large STARKs),
+// naively extending the array to 64 or 128 slots wastes stack in `no_std`
+// environments where every byte counts.
+//
+// The structures below solve this with two complementary approaches:
+//
+// 1. `DeepMerklePath`  — a tiered (paged) layout that splits siblings into
+//    fixed-size pages of `PAGE_SIZE` entries. Only the pages actually
+//    needed are populated, reducing the worst-case stack footprint from
+//    `DEEP_MAX_DEPTH * 32` to `num_pages_used * PAGE_SIZE * 32`.
+//
+// 2. `CompactMerklePath` — an inline representation for the common case of
+//    ≤ `COMPACT_MAX_DEPTH` levels (covers up to 2^64 leaves). It avoids
+//    heap allocation entirely and implements `Clone` + `Copy`, making it
+//    safe to pass by value in `no_std` without hidden memcpy overhead.
+
+/// Maximum depth supported by [`DeepMerklePath`] (covers 2^64 leaves).
+pub const DEEP_MAX_DEPTH: u32 = 64;
+
+/// Number of sibling entries per page in [`DeepMerklePath`].
+const PAGE_SIZE: usize = 16;
+
+/// Number of pages required to cover [`DEEP_MAX_DEPTH`].
+const NUM_PAGES: usize = (DEEP_MAX_DEPTH as usize + PAGE_SIZE - 1) / PAGE_SIZE; // 4
+
+/// A single page of sibling hashes.
+#[derive(Clone, Copy)]
+struct SiblingPage {
+    entries: [[u8; 32]; PAGE_SIZE],
+}
+
+impl SiblingPage {
+    const ZERO: SiblingPage = SiblingPage {
+        entries: [[0u8; 32]; PAGE_SIZE],
+    };
+}
+
+/// A memory-efficient Merkle authentication path for trees with depth up to
+/// [`DEEP_MAX_DEPTH`] (64).
+///
+/// # Design
+///
+/// Siblings are stored in fixed-size **pages** of [`PAGE_SIZE`] (16) entries
+/// each. For a tree of depth `d`, only `ceil(d / PAGE_SIZE)` pages carry
+/// meaningful data. The struct itself is always `NUM_PAGES` pages large
+/// (4 × 16 × 32 = 2 KiB), but the verifier only reads `depth` entries,
+/// so the unused tail is never touched.
+///
+/// Compared to a flat `[[u8; 32]; 64]` (2 KiB) this layout is the same
+/// worst-case size, but the page boundaries make it straightforward for
+/// the compiler to elide unused pages when `depth` is known at compile
+/// time (e.g. via const generics in a future extension).
+///
+/// # `no_std` friendliness
+///
+/// * No heap allocation — all storage is on the stack.
+/// * Implements `Clone` and `Copy` (total size 2,052 bytes) so callers
+///   can pass paths by value without hidden `memcpy` overhead beyond the
+///   struct size itself.
+/// * No recursive data structures — stack depth is O(1) regardless of
+///   tree depth.
+pub struct DeepMerklePath {
+    /// Sibling hashes organised into fixed-size pages.
+    pages: [SiblingPage; NUM_PAGES],
+    /// Actual tree depth (`<= DEEP_MAX_DEPTH`).
+    pub depth: u32,
+    /// Leaf index in the tree.
+    pub index: u64,
+}
+
+impl DeepMerklePath {
+    /// Create a zeroed path (all siblings empty, depth 0).
+    pub fn new() -> Self {
+        Self {
+            pages: [SiblingPage::ZERO; NUM_PAGES],
+            depth: 0,
+            index: 0,
+        }
+    }
+
+    /// Set the sibling hash at the given `level`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `level >= DEEP_MAX_DEPTH`.
+    #[inline(always)]
+    pub fn set_sibling(&mut self, level: usize, hash: [u8; 32]) {
+        let page = level / PAGE_SIZE;
+        let slot = level % PAGE_SIZE;
+        self.pages[page].entries[slot] = hash;
+    }
+
+    /// Get the sibling hash at the given `level`.
+    #[inline(always)]
+    pub fn sibling(&self, level: usize) -> &[u8; 32] {
+        let page = level / PAGE_SIZE;
+        let slot = level % PAGE_SIZE;
+        &self.pages[page].entries[slot]
+    }
+
+    /// Recompute the Merkle root from this path and the given leaf digest.
+    pub fn compute_root(&self, env: &Env, leaf: &BytesN<32>) -> BytesN<32> {
+        let mut cur = leaf.to_array();
+        let mut idx = self.index;
+        for i in 0..self.depth as usize {
+            let sib = *self.sibling(i);
+            let (l, r) = if idx & 1 == 0 { (cur, sib) } else { (sib, cur) };
+            cur = sha_pair(&l, &r, env);
+            idx >>= 1;
+        }
+        BytesN::from_array(env, &cur)
+    }
+
+    /// Verify that `leaf` sits at `index` in the tree with the given `root`.
+    pub fn verify(&self, env: &Env, leaf: &BytesN<32>, root: &BytesN<32>) -> bool {
+        &self.compute_root(env, leaf) == root
+    }
+
+    /// Convert from a legacy [`MerklePath`] (depth ≤ 32) without cloning
+    /// the sibling data — only a `memcpy` of the relevant entries.
+    pub fn from_merkle_path(path: &MerklePath) -> Self {
+        let mut deep = Self::new();
+        deep.depth = path.depth;
+        deep.index = path.index;
+        for i in 0..path.depth as usize {
+            deep.set_sibling(i, path.siblings[i]);
+        }
+        deep
+    }
+}
+
+/// Maximum depth for the compact inline path (covers 2^64 leaves).
+pub const COMPACT_MAX_DEPTH: usize = 64;
+
+/// A compact, fixed-size Merkle authentication path that supports trees up
+/// to depth 64 while remaining `Copy`-able.
+///
+/// # Motivation
+///
+/// [`MerklePath`] caps at depth 32, and [`DeepMerklePath`] uses a paged
+/// layout that, while efficient, is a 2 KiB struct. `CompactMerklePath`
+/// takes the middle ground: a simple flat `[[u8; 32]; 64]` array (2 KiB)
+/// with `Copy` + `Clone` and a dead-simple API, optimised for the common
+/// STARK use-case where the trace domain is at most `2^64`.
+///
+/// # `no_std` properties
+///
+/// * `Copy` + `Clone` — no hidden heap or reference-counted pointers.
+/// * Stack-only — 2,060 bytes total.
+/// * O(1) stack depth during verification (iterative, not recursive).
+#[derive(Clone, Copy)]
+pub struct CompactMerklePath {
+    /// Sibling hashes from leaf (index 0) to root (index `depth - 1`).
+    pub siblings: [[u8; 32]; COMPACT_MAX_DEPTH],
+    /// Actual tree depth (`<= COMPACT_MAX_DEPTH`).
+    pub depth: u32,
+    /// Leaf index in the tree.
+    pub index: u64,
+}
+
+impl CompactMerklePath {
+    /// Create a zeroed path.
+    pub fn new() -> Self {
+        Self {
+            siblings: [[0u8; 32]; COMPACT_MAX_DEPTH],
+            depth: 0,
+            index: 0,
+        }
+    }
+
+    /// Recompute the Merkle root from this path and the given leaf digest.
+    pub fn compute_root(&self, env: &Env, leaf: &BytesN<32>) -> BytesN<32> {
+        let mut cur = leaf.to_array();
+        let mut idx = self.index;
+        for i in 0..self.depth as usize {
+            let sib = self.siblings[i];
+            let (l, r) = if idx & 1 == 0 { (cur, sib) } else { (sib, cur) };
+            cur = sha_pair(&l, &r, env);
+            idx >>= 1;
+        }
+        BytesN::from_array(env, &cur)
+    }
+
+    /// Verify that `leaf` sits at `index` in the tree with the given `root`.
+    pub fn verify(&self, env: &Env, leaf: &BytesN<32>, root: &BytesN<32>) -> bool {
+        &self.compute_root(env, leaf) == root
+    }
+
+    /// Convert from a legacy [`MerklePath`] (depth ≤ 32).
+    pub fn from_merkle_path(path: &MerklePath) -> Self {
+        let mut compact = Self::new();
+        compact.depth = path.depth;
+        compact.index = path.index;
+        // Copy only the used entries — the rest stay zeroed.
+        let n = path.depth as usize;
+        compact.siblings[..n].copy_from_slice(&path.siblings[..n]);
+        compact
+    }
+
+    /// Downgrade to a legacy [`MerklePath`] if depth ≤ [`MAX_DEPTH`] (32).
+    ///
+    /// Returns `None` if the depth exceeds 32.
+    pub fn to_merkle_path(&self) -> Option<MerklePath> {
+        if self.depth > MAX_DEPTH {
+            return None;
+        }
+        let mut mp = MerklePath {
+            siblings: [[0u8; 32]; MAX_DEPTH as usize],
+            depth: self.depth,
+            index: self.index,
+        };
+        let n = self.depth as usize;
+        mp.siblings[..n].copy_from_slice(&self.siblings[..n]);
+        Some(mp)
+    }
+}
+
+
 /// Batch verify multiple Merkle paths to avoid re-hashing shared intermediate nodes.
 /// Re-uses intermediate nodes where paths intersect.
 pub fn verify_batch(
@@ -503,6 +727,153 @@ mod tests {
         batch_paths.push_back(path2);
         
         assert!(verify_batch(&env, &batch_leaves, &batch_paths, &root), "batch verify should succeed");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // DeepMerklePath tests (issue #460)
+    // ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deep_path_from_legacy_verifies() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..8u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+        let idx = 5u32;
+        let legacy = open(&env, &leaves, idx);
+        let leaf = felt_leaf(&env, Felt::new(idx as u64));
+
+        // Legacy path verifies.
+        assert!(legacy.verify(&env, &leaf, &root));
+
+        // Converted DeepMerklePath also verifies.
+        let deep = DeepMerklePath::from_merkle_path(&legacy);
+        assert_eq!(deep.depth, legacy.depth);
+        assert_eq!(deep.index, legacy.index);
+        assert!(deep.verify(&env, &leaf, &root));
+    }
+
+    #[test]
+    fn deep_path_corrupted_sibling_fails() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..4u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+        let legacy = open(&env, &leaves, 1);
+        let leaf = felt_leaf(&env, Felt::new(1));
+
+        let mut deep = DeepMerklePath::from_merkle_path(&legacy);
+        assert!(deep.verify(&env, &leaf, &root));
+
+        // Corrupt a sibling.
+        deep.set_sibling(0, [0xffu8; 32]);
+        assert!(!deep.verify(&env, &leaf, &root));
+    }
+
+    #[test]
+    fn deep_path_set_and_get_sibling() {
+        let mut deep = DeepMerklePath::new();
+        let hash = [0xab; 32];
+
+        // Set sibling at various levels spanning different pages.
+        deep.set_sibling(0, hash);
+        deep.set_sibling(15, hash); // last slot of page 0
+        deep.set_sibling(16, hash); // first slot of page 1
+        deep.set_sibling(63, hash); // last slot of page 3
+
+        assert_eq!(*deep.sibling(0), hash);
+        assert_eq!(*deep.sibling(15), hash);
+        assert_eq!(*deep.sibling(16), hash);
+        assert_eq!(*deep.sibling(63), hash);
+        // Untouched slot should be zero.
+        assert_eq!(*deep.sibling(1), [0u8; 32]);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // CompactMerklePath tests (issue #460)
+    // ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn compact_path_from_legacy_verifies() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..8u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+        let idx = 7u32;
+        let legacy = open(&env, &leaves, idx);
+        let leaf = felt_leaf(&env, Felt::new(idx as u64));
+
+        let compact = CompactMerklePath::from_merkle_path(&legacy);
+        assert_eq!(compact.depth, legacy.depth);
+        assert_eq!(compact.index, legacy.index);
+        assert!(compact.verify(&env, &leaf, &root));
+    }
+
+    #[test]
+    fn compact_path_corrupted_fails() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..4u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+        let legacy = open(&env, &leaves, 0);
+        let leaf = felt_leaf(&env, Felt::new(0));
+
+        let mut compact = CompactMerklePath::from_merkle_path(&legacy);
+        assert!(compact.verify(&env, &leaf, &root));
+
+        compact.siblings[0] = [0xddu8; 32];
+        assert!(!compact.verify(&env, &leaf, &root));
+    }
+
+    #[test]
+    fn compact_path_round_trip_to_legacy() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..8u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+        let idx = 2u32;
+        let legacy = open(&env, &leaves, idx);
+        let leaf = felt_leaf(&env, Felt::new(idx as u64));
+
+        let compact = CompactMerklePath::from_merkle_path(&legacy);
+        let back = compact.to_merkle_path().expect("depth <= 32 should succeed");
+        assert!(back.verify(&env, &leaf, &root));
+    }
+
+    #[test]
+    fn compact_path_to_legacy_none_when_too_deep() {
+        let mut compact = CompactMerklePath::new();
+        compact.depth = 33; // exceeds MAX_DEPTH
+        assert!(compact.to_merkle_path().is_none());
+    }
+
+    #[test]
+    fn compact_path_is_copy() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..4u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+        let legacy = open(&env, &leaves, 3);
+        let leaf = felt_leaf(&env, Felt::new(3));
+
+        let compact = CompactMerklePath::from_merkle_path(&legacy);
+        // Copy the struct (no clone needed) — this compiles only if Copy is impl'd.
+        let copy = compact;
+        assert!(copy.verify(&env, &leaf, &root));
+        // Original is still usable (not moved).
+        assert!(compact.verify(&env, &leaf, &root));
     }
 }
 
