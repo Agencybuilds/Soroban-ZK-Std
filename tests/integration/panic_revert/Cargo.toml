@@ -1,0 +1,7 @@
+[package]
+name = "panic-revert-tests"
+version = "0.1.0"
+
+[dependencies]
+soroban-sdk = { path = "../../soroban-sdk" }
+soroban-test-env = { path = "../../soroban-test-env" }

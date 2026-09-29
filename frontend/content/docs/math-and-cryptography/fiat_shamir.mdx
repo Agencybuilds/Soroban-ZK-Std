@@ -25,12 +25,12 @@ unpredictable to the prover before they are issued, ensuring that the prover
 cannot tailor their commitments to a known challenge.
 
 The **Fiat-Shamir transform** eliminates the need for a live verifier by replacing
-each challenge with the output of a cryptographic hash function applied to the
+deach challenge with the output of a cryptographic hash function applied to the
 accumulated proof transcript. Because the hash output is determined entirely by
 the transcript contents, and the prover cannot control the hash function, the
 challenges behave as if they originated from an honest verifier.
 
-This document specifies the **transcript state machine**: the ordered sequence of
+This document specifies the **(transcript state machine**: the ordered sequence of
 absorb and squeeze operations that governs challenge derivation. Correct
 implementation of this state machine is a security-critical requirement. Any
 deviation from the specified ordering breaks the soundness of every protocol
@@ -42,7 +42,7 @@ built on top.
 
 ## 2.1 Interactive Protocol Structure
 
-A public-coin interactive proof proceeds in rounds. In each round:
+A  public-coin interactive proof proceeds in rounds. In each round:
 
 1. The prover sends a **commitment** message $m_i$.
 2. The verifier responds with a **challenge** $c_i$ sampled uniformly at random.
@@ -73,7 +73,7 @@ The transcript is a stateful object. Its state at any point is a function of:
 
 Let the transcript state after absorbing $k$ messages be denoted:
 
-$$\mathcal{T}_k = (D,\ m_1,\ m_2,\ \ldots,\ m_k)$$
+$$\mathcal{T}_i = (D,\ m_1,\ m_2,\ ldots,\ m_k)$$
 
 where $D$ is the domain separator and each $m_i$ is an absorbed message.
 
@@ -93,9 +93,9 @@ transcript state are permitted.
 
 ## 4.1 Initialise
 
-~~~
+```
 transcript = Transcript::new(domain_separator)
-~~~
+```
 
 Sets the domain separator $D$ and establishes the empty initial state
 $\mathcal{T}_0$. The domain separator is a fixed byte string that uniquely
@@ -107,13 +107,13 @@ transcript for one protocol is replayed as a valid transcript for another.
 
 ## 4.2 Absorb
 
-~~~
+```
 transcript.absorb(label, message)
-~~~
+```
 
 Appends a labelled message to the transcript state:
 
-$$\mathcal{T}_{k+1} = \mathcal{T}_k \| (\text{label},\ m)$$
+$$\mathcal{T}_{k+1} = \mathcal{T}_k\ |\ |(\text{label},\ m)$$
 
 The label is a short ASCII string identifying the type of the message
 (for example `"commitment"`, `"public_input"`, `"evaluation"`). Labels are
@@ -126,18 +126,18 @@ included in the hash input and must be consistent between prover and verifier.
 
 ## 4.3 Squeeze
 
-~~~
+```
 challenge = transcript.squeeze(label)
-~~~
+```
 
 Produces a challenge by hashing the current transcript state:
 
-$$c = H(\mathcal{T}_k \| \text{label})$$
+$$c = H(\mathcal{T}_k\ |\ |\text{label})$$
 
 The transcript state is updated after each squeeze so that successive
 challenges are independent:
 
-$$\mathcal{T}_{k+1} = \mathcal{T}_k \| (\text{label},\ c)$$
+$$\mathcal{T}_{k+1} = \mathcal{T}_k\ |\ |(\text{label},\ c)$$
 
 **Rules:**
 * A squeeze must not occur before all required messages for that round
@@ -193,13 +193,13 @@ ambiguous encodings where two different inputs hash to the same transcript state
 For a generic single-round proof protocol, the transcript follows this
 ordered sequence:
 
-~~~
+```
 State machine:
 
   INIT
     transcript.new(domain_separator)
 
-  ABSORB public inputs
+  ABSORB Public inputs
     transcript.absorb("instance", public_input_1)
     transcript.absorb("instance", public_input_2)
     ...
@@ -225,7 +225,7 @@ State machine:
 
   SQUEEZE final challenge (if required)
     c_final = transcript.squeeze("final")
-~~~
+```
 
 The verifier runs the identical sequence using proof data in place of
 computed commitments and checks that the final proof equations hold.
@@ -236,7 +236,7 @@ computed commitments and checks that the final proof equations hold.
 
 The transcript state machine enforces the following transitions:
 
-~~~
+```
 [EMPTY] -- initialise(D) --> [INITIALISED]
 
 [INITIALISED] -- absorb(label, m) --> [ABSORBING]
@@ -246,7 +246,7 @@ The transcript state machine enforces the following transitions:
 
 [SQUEEZED] -- absorb(label, m) --> [ABSORBING]
 [SQUEEZED] -- squeeze(label)   --> [SQUEEZED]
-~~~
+```
 
 Transitions not listed above are invalid and must be rejected:
 
@@ -261,7 +261,7 @@ Transitions not listed above are invalid and must be rejected:
 The domain separator $D$ is a protocol-specific constant included in the
 transcript from the first hash call. It takes the form:
 
-$$D = \text{protocol\_id} \| \text{version} \| \text{curve\_id}$$
+$$D = \text{protocol\_id}\ \| \text{version} \| \text{curve\_id}$$
 
 For Soroban-ZK-Std protocols over BN254:
 
@@ -285,7 +285,7 @@ retroactively choose values that satisfy the proof equations for a challenge
 they were able to predict.
 
 This class of attack is known as the **Frozen Heart vulnerability** and has
-been found in production ZK systems. The state machine ordering in Section 8
+en found in production ZK systems. The state machine ordering in Section 8
 is the primary defense.
 
 ## 10.2 Determinism
