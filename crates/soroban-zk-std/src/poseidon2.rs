@@ -124,18 +124,37 @@ fn reduce_once(x: &[u8; 32], m: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// Fixed number of conditional subtractions used by [`reduce_full`]. The BN254
+/// Fr modulus has 254 bits, so for any 32-byte `x` we have `x / m < 2^3`: at
+/// most seven subtractions are ever needed. Eight rounds guarantee the result
+/// is the canonical representative for any input.
+const REDUCE_ROUNDS: usize = 8;
+
+/// Reduce an arbitrary 32-byte value `x` mod `m` to its canonical
+/// representative using a fixed number of branchless conditional subtractions.
+/// Runs in constant time with respect to `x` and never calls a host arithmetic
+/// operation, so it cannot trap on hostile near-`2^256` inputs.
+fn reduce_full(x: &[u8; 32], m: &[u8; 32]) -> [u8; 32] {
+    let mut cur = *x;
+    for _ in 0..REDUCE_ROUNDS {
+        cur = reduce_once(&cur, m);
+    }
+    cur
+}
+
 /// Constant-time modular addition. Never calls `U256::sub`/`>=` on raw
 /// operands (both can trap or branch on secret magnitude via the host);
-/// instead reduces both operands and the final sum using masked byte
-/// selection over raw arrays (Issue #372).
+/// instead it fully reduces both operands and the final sum using masked byte
+/// selection over raw arrays (Issue #372). Accepting unreduced (even
+/// near-`2^256`) operands keeps the routine panic-free on hostile inputs.
 fn field_add(a: &U256, b: &U256, modulus: &U256) -> U256 {
     let env = a.env();
     let a_arr = u256_to_be_array(a);
     let b_arr = u256_to_be_array(b);
     let m_arr = u256_to_be_array(modulus);
 
-    let a_r = reduce_once(&a_arr, &m_arr);
-    let b_r = reduce_once(&b_arr, &m_arr);
+    let a_r = reduce_full(&a_arr, &m_arr);
+    let b_r = reduce_full(&b_arr, &m_arr);
 
     let sum33 = be_add32(&a_r, &b_r);
     let m33 = zero_extend32(&m_arr);
@@ -684,7 +703,7 @@ impl Poseidon2Sponge {
     pub fn absorb(&mut self, inputs: &[U256]) {
         for input in inputs {
             let cur = self.state.get(self.rate_idx).unwrap();
-            let next = field_add(&self.env, &cur, input, &self.modulus);
+            let next = field_add(&cur, input, &self.modulus);
             self.state.set(self.rate_idx, next);
             self.rate_idx += 1;
             if self.rate_idx == RATE {
@@ -841,7 +860,7 @@ mod tests {
         let a = modulus.clone().sub(&U256::from_u128(&env, 1));
         let b = U256::from_u128(&env, 2);
 
-        let result = field_add(&env, &a, &b, &modulus);
+        let result = field_add(&a, &b, &modulus);
 
         assert_eq!(result, U256::from_u128(&env, 1));
     }
@@ -862,7 +881,7 @@ mod tests {
         let b = max.sub(&U256::from_u128(&env, 2));
 
         // Must not panic and must return a properly reduced field element.
-        let result = field_add(&env, &a, &b, &modulus);
+        let result = field_add(&a, &b, &modulus);
 
         // Cross-check the expected value in ethnum space (reduce each operand
         // first so the addition is in-range, exactly as field_add does).
