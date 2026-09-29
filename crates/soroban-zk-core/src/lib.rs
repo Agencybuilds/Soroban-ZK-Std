@@ -7,6 +7,12 @@ pub mod bulletproofs;
 pub mod hash;
 pub mod poseidon2;
 pub mod rescue;
+/// Cryptographic memory hygiene: volatile-zeroing RAII guards (Issue #466).
+///
+/// Exports [`zeroize::SensitiveBuffer`] and [`zeroize::sensitive_vec::SensitiveVec`]
+/// for use in verifier code that must wipe temporary field elements and scalars
+/// when a proof verification fails midway.
+pub mod zeroize;
 /// Bit-packing and unpacking utilities for SHA-256 word conversion (Issue #457).
 ///
 /// Provides `pack_bytes_to_words`, `unpack_words_to_bytes`, `field_to_words`,
