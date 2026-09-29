@@ -8,6 +8,7 @@ pub mod halo2;
 pub mod host;
 pub mod pairing;
 pub mod poseidon2;
+pub mod rescue_prime;
 pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
@@ -17,6 +18,10 @@ pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
     vk_to_bytes, G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey, VkMeta, VkStorageKey,
     VK_CHUNK_SIZE,
+};
+
+pub use rescue_prime::{
+    rescue_prime_hash, rescue_prime_hash_cached, RescueSponge, RescueParams, STATE, ROUNDS,
 };
 
 use ethnum::u256 as eth_u256;

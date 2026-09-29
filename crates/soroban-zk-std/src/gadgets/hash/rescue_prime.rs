@@ -107,6 +107,138 @@ fn from_eth_v(env: &Env, v: eth_u256) -> U256 {
     U256::from_be_bytes(env, &Bytes::from_array(env, &v.to_be_bytes()))
 }
 
+/// Rescue-Prime sponge over BN254 Fr (t=3, rate=2, capacity=1).
+///
+/// The permutation runs in guest code (no host call), making it suitable for
+/// in-circuit verification as well as native execution.
+///
+/// # Example
+/// ```ignore
+/// let mut sponge = RescueSponge::new(&env);
+/// sponge.absorb(&inputs);
+/// let digest = sponge.squeeze();
+/// ```
+pub struct RescueSponge {
+    env: Env,
+    state: [eth_u256; STATE],
+    rate_idx: usize,
+    params: RescueParams,
+}
+
+impl RescueSponge {
+    /// Create a new sponge with zeroed state, building the BN254 constants
+    /// from code (no contract storage required).
+    ///
+    /// The round keys and MDS matrix are computed once here and reused across
+    /// every [`RescueSponge::absorb`]/[`RescueSponge::squeeze`] permutation,
+    /// rather than being rebuilt on each permutation.
+    pub fn new(env: &Env) -> Self {
+        let params = RescueParams::new();
+        let state = [eth_u256::ZERO; STATE];
+        Self {
+            env: env.clone(),
+            state,
+            rate_idx: 0,
+            params,
+        }
+    }
+
+    /// Create a new sponge whose BN254 constants are sourced from the contract
+    /// instance storage cache.
+    ///
+    /// On the first invocation within a contract the constants are computed and
+    /// written to `StorageType::Instance`; subsequent invocations read them back
+    /// from storage instead of rebuilding them. Must be called from within a
+    /// contract invocation context (it touches instance storage).
+    pub fn new_cached(env: &Env) -> Self {
+        let params = crate::cache::rescue_prime_params(env);
+        let state = [eth_u256::ZERO; STATE];
+        Self {
+            env: env.clone(),
+            state,
+            rate_idx: 0,
+            params,
+        }
+    }
+
+    /// Absorb a slice of BN254 Fr field elements into the sponge.
+    pub fn absorb(&mut self, inputs: &[U256]) {
+        let rate = STATE - 1;
+        for input in inputs {
+            let cur = self.state[self.rate_idx + 1];
+            let next = fadd(cur, to_eth_v(input));
+            self.state[self.rate_idx + 1] = next;
+            self.rate_idx += 1;
+            if self.rate_idx == rate {
+                self.params.permute(&mut self.state);
+                self.rate_idx = 0;
+            }
+        }
+    }
+
+    /// Squeeze one field element.
+    ///
+    /// Pads and applies the permutation if any unprocessed input remains,
+    /// then returns the first element of the rate portion (state[1]).
+    pub fn squeeze(&mut self) -> U256 {
+        // Flush any buffered input with a final permutation.
+        self.params.permute(&mut self.state);
+        self.rate_idx = 0;
+        from_eth_v(&self.env, self.state[1])
+    }
+}
+
+/// Hash a slice of BN254 Fr field elements to a single field element using
+/// the Rescue-Prime sponge (t=3, rate=2, capacity=1).
+///
+/// Compatible with the Rescue-Prime specification (forward/inverse S-box,
+/// Cauchy MDS matrix, LCG round keys).
+pub fn rescue_prime_hash(env: &Env, message: &[U256]) -> U256 {
+    let mut sponge = RescueSponge::new(env);
+    sponge.absorb(message);
+    sponge.squeeze()
+}
+
+/// Instance-cached variant of [`rescue_prime_hash`].
+///
+/// Identical output to [`rescue_prime_hash`], but the BN254 round keys and
+/// MDS matrix are loaded from (and lazily populated into) the contract
+/// instance storage cache rather than rebuilt from code. Must be called from
+/// within a contract invocation context.
+pub fn rescue_prime_hash_cached(env: &Env, message: &[U256]) -> U256 {
+    let mut sponge = RescueSponge::new_cached(env);
+    sponge.absorb(message);
+    sponge.squeeze()
+}
+
+/// Build the MDS matrix as nested `Vec<Vec<U256>>` for storage in instance cache.
+pub fn build_mds_for_cache(env: &Env) -> Vec<Vec<U256>> {
+    let mds = build_mds();
+    let mut outer = Vec::new(env);
+    for i in 0..STATE {
+        let mut inner = Vec::new(env);
+        for j in 0..STATE {
+            inner.push_back(from_eth_v(env, mds[i][j]));
+        }
+        outer.push_back(inner);
+    }
+    outer
+}
+
+/// Build the round keys as nested `Vec<Vec<U256>>` for storage in instance cache.
+pub fn build_round_keys_for_cache(env: &Env) -> Vec<Vec<U256>> {
+    let round_keys = build_round_keys();
+    let mut outer = Vec::new(env);
+    for r in 0..ROUNDS {
+        let mut inner = Vec::new(env);
+        for j in 0..STATE {
+            inner.push_back(from_eth_v(env, round_keys[r][j]));
+        }
+        outer.push_back(inner);
+    }
+    outer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +288,26 @@ mod tests {
         assert_eq!(h, rescue_prime_hash(&env, &[]));
         let bytes = h.to_be_bytes();
         let _ = bytes;
+    }
+
+    #[test]
+    fn sponge_absorb_squeeze() {
+        let env = env();
+        let mut sponge = RescueSponge::new(&env);
+        sponge.absorb(&[U256::from_u128(&env, 1), U256::from_u128(&env, 2)]);
+        let d1 = sponge.squeeze();
+        let d2 = sponge.squeeze();
+        assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn sponge_matches_direct_hash() {
+        let env = env();
+        let inputs = [U256::from_u128(&env, 42), U256::from_u128(&env, 99)];
+        let h1 = rescue_prime_hash(&env, &inputs);
+        let mut sponge = RescueSponge::new(&env);
+        sponge.absorb(&inputs);
+        let h2 = sponge.squeeze();
+        assert_eq!(h1, h2);
     }
 }
