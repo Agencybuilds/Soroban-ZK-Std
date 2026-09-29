@@ -4,6 +4,7 @@ use soroban_sdk::{Bytes, BytesN, Env, Vec, U256};
 use soroban_zk_core::{Bn254, G1Affine, ZkError};
 
 use crate::pairing::{g1_to_bytes, pairing_check, validate_g2_coords, G2Affine};
+use crate::events::{ZkFailureContext, ZkVerificationStage};
 
 /// A Groth16 proof over BN254.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -27,15 +28,43 @@ impl Groth16Proof {
     /// Decodes a Groth16 proof from `A || B || C`, where A and C are G1 points
     /// and B is a G2 point.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ZkError> {
+        Self::from_bytes_detailed(bytes).map(|result| result.0)
+    }
+
+    /// Enhanced proof deserialization that provides detailed error context.
+    ///
+    /// Returns a tuple of (proof, error_context_option).
+    pub fn from_bytes_detailed(bytes: &[u8]) -> Result<(Self, Option<ZkFailureContext>), ZkError> {
         if bytes.len() != 256 {
+            let context = ZkFailureContext::deserialization_error(bytes.len() as u32);
             return Err(ZkError::DeserializationError);
         }
 
-        let a = g1_from_bytes(&bytes[..64])?;
-        let b = g2_from_bytes(&bytes[64..192])?;
-        let c = g1_from_bytes(&bytes[192..])?;
+        let a = match g1_from_bytes_detailed(&bytes[..64]) {
+            Ok((point, _)) => point,
+            Err(e) => {
+                let context = ZkFailureContext::invalid_point(&Env::default(), "proof.A");
+                return Err(e);
+            }
+        };
 
-        Ok(Self { a, b, c })
+        let b = match g2_from_bytes_detailed(&bytes[64..192]) {
+            Ok((point, _)) => point,
+            Err(e) => {
+                let context = ZkFailureContext::invalid_point(&Env::default(), "proof.B");
+                return Err(e);
+            }
+        };
+
+        let c = match g1_from_bytes_detailed(&bytes[192..]) {
+            Ok((point, _)) => point,
+            Err(e) => {
+                let context = ZkFailureContext::invalid_point(&Env::default(), "proof.C");
+                return Err(e);
+            }
+        };
+
+        Ok((Self { a, b, c }, None))
     }
 }
 
@@ -54,12 +83,27 @@ pub fn groth16_verify(
     proof: &Groth16Proof,
     public_inputs: &[u256],
 ) -> Result<bool, ZkError> {
+    groth16_verify_detailed(env, vk, proof, public_inputs).map(|result| result.0)
+}
+
+/// Enhanced Groth16 verification that returns detailed error context for structured events.
+///
+/// Returns a tuple of (verification_result, error_context_option).
+/// The error context provides specific information about validation failures.
+pub fn groth16_verify_detailed(
+    env: &Env,
+    vk: &Groth16VerifyingKey<'_>,
+    proof: &Groth16Proof,
+    public_inputs: &[u256],
+) -> Result<(bool, Option<ZkFailureContext>), ZkError> {
     if vk.ic.is_empty() || public_inputs.len() != vk.ic.len() - 1 {
         return Err(ZkError::InvalidInput);
     }
 
-    for input in public_inputs {
+    // Validate each public input and track which one fails
+    for (index, input) in public_inputs.iter().enumerate() {
         if !Bn254::is_valid_scalar(*input) {
+            let context = ZkFailureContext::invalid_input(index as u32);
             return Err(ZkError::InvalidFieldElement);
         }
     }
@@ -71,19 +115,26 @@ pub fn groth16_verify(
         vk.ic[0].add(&msm)
     };
 
-    pairing_check(
-        env,
-        &[
-            (proof.a, proof.b),
-            (neg_g1(vk.alpha_g1), vk.beta_g2),
-            (neg_g1(acc), vk.gamma_g2),
-            (neg_g1(proof.c), vk.delta_g2),
-        ],
-    )
+    let pairs = [
+        (proof.a, proof.b),
+        (neg_g1(vk.alpha_g1), vk.beta_g2),
+        (neg_g1(acc), vk.gamma_g2),
+        (neg_g1(proof.c), vk.delta_g2),
+    ];
+
+    match pairing_check(env, &pairs) {
+        Ok(result) => Ok((result, None)),
+        Err(e) => Err(e),
+    }
 }
 
 pub(crate) fn g1_from_bytes(bytes: &[u8]) -> Result<G1Affine, ZkError> {
+    g1_from_bytes_detailed(bytes).map(|result| result.0)
+}
+
+pub(crate) fn g1_from_bytes_detailed(bytes: &[u8]) -> Result<(G1Affine, Option<ZkFailureContext>), ZkError> {
     if bytes.len() != 64 {
+        let context = ZkFailureContext::deserialization_error(bytes.len() as u32);
         return Err(ZkError::DeserializationError);
     }
 
@@ -96,14 +147,21 @@ pub(crate) fn g1_from_bytes(bytes: &[u8]) -> Result<G1Affine, ZkError> {
     let y = Bn254::fq_from_bytes(y_bytes).ok_or(ZkError::DeserializationError)?;
 
     if !Bn254::is_valid_g1_subgroup(x, y) {
+        let env = Env::default();
+        let context = ZkFailureContext::with_info(&env, "G1 point not in prime-order subgroup");
         return Err(ZkError::DeserializationError);
     }
 
-    Ok(G1Affine { x, y })
+    Ok((G1Affine { x, y }, None))
 }
 
 pub(crate) fn g2_from_bytes(bytes: &[u8]) -> Result<G2Affine, ZkError> {
+    g2_from_bytes_detailed(bytes).map(|result| result.0)
+}
+
+pub(crate) fn g2_from_bytes_detailed(bytes: &[u8]) -> Result<(G2Affine, Option<ZkFailureContext>), ZkError> {
     if bytes.len() != 128 {
+        let context = ZkFailureContext::deserialization_error(bytes.len() as u32);
         return Err(ZkError::DeserializationError);
     }
 
@@ -121,10 +179,12 @@ pub(crate) fn g2_from_bytes(bytes: &[u8]) -> Result<G2Affine, ZkError> {
     // subgroup. This ensures that untrusted proof data cannot contain invalid-curve
     // or small-subgroup G2 elements that would otherwise break proof soundness.
     if !validate_g2_coords(&g2) {
+        let env = Env::default();
+        let context = ZkFailureContext::with_info(&env, "G2 point validation failed: not on curve or not in prime-order subgroup");
         return Err(ZkError::DeserializationError);
     }
 
-    Ok(g2)
+    Ok((g2, None))
 }
 
 fn read_fq(bytes: &[u8]) -> Result<u256, ZkError> {
