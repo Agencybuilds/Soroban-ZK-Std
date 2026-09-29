@@ -21,6 +21,14 @@
 //!   `require_auth` by the *calling contract* (see `ZkContract::set_verifying_key`).
 //! * The software fallback / deserialization re-validates every point, so a
 //!   corrupted chunk fails closed with [`ZkError::DeserializationError`].
+//!
+//! ## State-Rollback Safety Boundaries (Issue #466)
+//! [`VerificationContext`] is a RAII guard that ensures the short-lived
+//! proof-context flag written to `StorageType::Temporary` at the start of a
+//! verification run is **always** removed — whether the run succeeds, returns
+//! an error via `?`, or unwinds via a Soroban host trap.  Callers must use
+//! this guard instead of calling [`set_proof_context`] / [`clear_proof_context`]
+//! manually.
 
 use alloc::vec::Vec;
 use ethnum::u256;
@@ -300,6 +308,71 @@ pub fn clear_proof_context(env: &Env) {
         .remove(&ProofContextKey::Active);
 }
 
+// ── State-rollback safety boundary (Issue #466) ─────────────────────────────
+
+/// RAII guard for an in-flight verification run (Issue #466).
+///
+/// Constructed via [`VerificationContext::begin`], this guard writes a
+/// proof-context marker to `StorageType::Temporary` and **guarantees** that
+/// the marker is removed when the guard is dropped — whether the caller returns
+/// normally, returns an error through `?`, or the Soroban host aborts the
+/// invocation.
+///
+/// Because Soroban's WASM sandbox rolls back *all* ledger state changes on a
+/// contract panic, the `Drop` impl is defence-in-depth for the happy path
+/// (normal return and explicit error propagation) within a single invocation.
+/// For panic/trap paths the host-level rollback provides the ultimate
+/// guarantee.
+///
+/// ## Usage
+/// ```ignore
+/// let _ctx = VerificationContext::begin(&env, &proof_bytes);
+/// // … run verification …
+/// // guard is dropped here; temp storage is cleared regardless of outcome.
+/// ```
+pub struct VerificationContext<'env> {
+    env: &'env Env,
+}
+
+impl<'env> VerificationContext<'env> {
+    /// Marks the start of a verification run.
+    ///
+    /// Writes `payload` (typically the raw proof bytes) to
+    /// `StorageType::Temporary` under [`ProofContextKey::Active`].  The entry
+    /// is automatically cleared when the returned guard is dropped.
+    ///
+    /// Callers should bind the return value with a name (e.g. `let _ctx = …`)
+    /// so the guard lives for the entire verification scope.
+    #[inline]
+    pub fn begin(env: &'env Env, payload: &Bytes) -> Self {
+        set_proof_context(env, payload);
+        Self { env }
+    }
+
+    /// Returns `true` if the proof-context marker is currently set in
+    /// `StorageType::Temporary`.  Useful in tests to assert the guard is alive.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.env
+            .storage()
+            .temporary()
+            .has(&ProofContextKey::Active)
+    }
+}
+
+impl<'env> Drop for VerificationContext<'env> {
+    /// Unconditionally removes the proof-context flag from temporary storage.
+    ///
+    /// This runs whether the verification succeeded, failed, or the scope was
+    /// exited via `?`.  The volatile write performed by
+    /// `soroban_zk_core::zeroize::SensitiveBuffer` on any stack-resident
+    /// scalar buffers runs in tandem (those guards are dropped first because
+    /// Rust drops locals in reverse declaration order).
+    fn drop(&mut self) {
+        clear_proof_context(self.env);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +491,116 @@ mod tests {
             assert!(e.storage().temporary().has(&ProofContextKey::Active));
             clear_proof_context(&e);
             assert!(!e.storage().temporary().has(&ProofContextKey::Active));
+        });
+    }
+
+    // ── VerificationContext RAII tests (Issue #466) ──────────────────────────
+
+    /// The context guard sets the flag on construction and removes it when the
+    /// binding goes out of scope on the happy path.
+    #[test]
+    fn verification_context_clears_on_normal_drop() {
+        let e = env();
+        let id = e.register(crate::ZkContract, ());
+        e.as_contract(&id, || {
+            let payload = SdkBytes::from_array(&e, &[0xAA, 0xBB, 0xCC, 0xDD]);
+            {
+                let ctx = VerificationContext::begin(&e, &payload);
+                // Guard is live: flag must be present.
+                assert!(ctx.is_active(), "context flag must be set while guard is alive");
+                assert!(
+                    e.storage().temporary().has(&ProofContextKey::Active),
+                    "temporary storage must hold the context key"
+                );
+                // Drop happens here at end of block.
+            }
+            // After drop: temporary storage must no longer hold the context key.
+            assert!(
+                !e.storage().temporary().has(&ProofContextKey::Active),
+                "VerificationContext::drop must have removed the temporary key"
+            );
+        });
+    }
+
+    /// When an error is propagated through `?` the guard still fires on drop.
+    /// We simulate this by constructing the guard, then returning early from a
+    /// closure that captures the env — the guard drops with the closure.
+    #[test]
+    fn verification_context_clears_on_early_return() {
+        let e = env();
+        let id = e.register(crate::ZkContract, ());
+        e.as_contract(&id, || {
+            let payload = SdkBytes::from_array(&e, &[1, 2, 3, 4]);
+
+            // Simulate an early-return path: the closure returns Err after the
+            // guard is created, which drops the guard before the function exits.
+            let result: Result<(), ZkError> = (|| {
+                let _ctx = VerificationContext::begin(&e, &payload);
+                // Simulate a mid-verification failure (e.g. invalid public input).
+                return Err(ZkError::InvalidFieldElement);
+                #[allow(unreachable_code)]
+                Ok(())
+            })();
+
+            assert_eq!(result, Err(ZkError::InvalidFieldElement));
+
+            // The temporary storage must have been cleared by the guard's Drop
+            // even though the closure returned early via `?`.
+            assert!(
+                !e.storage().temporary().has(&ProofContextKey::Active),
+                "VerificationContext must wipe temp storage even on early-return error paths"
+            );
+        });
+    }
+
+    /// Two consecutive verification runs must not see each other's context.
+    #[test]
+    fn verification_context_does_not_bleed_across_runs() {
+        let e = env();
+        let id = e.register(crate::ZkContract, ());
+        e.as_contract(&id, || {
+            let payload1 = SdkBytes::from_array(&e, &[1, 1, 1, 1]);
+            let payload2 = SdkBytes::from_array(&e, &[2, 2, 2, 2]);
+
+            // First run.
+            {
+                let _ctx = VerificationContext::begin(&e, &payload1);
+            }
+            assert!(!e.storage().temporary().has(&ProofContextKey::Active));
+
+            // Second run must be able to start fresh without residual state.
+            {
+                let ctx = VerificationContext::begin(&e, &payload2);
+                assert!(ctx.is_active());
+            }
+            assert!(
+                !e.storage().temporary().has(&ProofContextKey::Active),
+                "second run must also clean up after itself"
+            );
+        });
+    }
+
+    /// Nested / double begin: the outer guard's drop must not resurrect the key
+    /// after the inner guard already removed it.  In practice callers should
+    /// never nest contexts, but we verify the behaviour is safe (the `remove`
+    /// call on a missing key is a no-op in Soroban).
+    #[test]
+    fn verification_context_nested_is_safe() {
+        let e = env();
+        let id = e.register(crate::ZkContract, ());
+        e.as_contract(&id, || {
+            let p = SdkBytes::from_array(&e, &[0xFF; 4]);
+            let outer = VerificationContext::begin(&e, &p);
+            {
+                let _inner = VerificationContext::begin(&e, &p);
+                // inner drops here, removing the key.
+            }
+            // outer drops here — `remove` on a missing key must not panic.
+            drop(outer);
+            assert!(
+                !e.storage().temporary().has(&ProofContextKey::Active),
+                "storage must be clear after all context guards are dropped"
+            );
         });
     }
 

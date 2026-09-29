@@ -32,3 +32,10 @@ kani = "0.0.1"
 [[bench]]
 name = "g1_ops"
 harness = false
+
+# Issue #449 — gas profiling: Bulletproofs vs Groth16.
+# The prover feature is required so benchmark fixtures can generate valid proofs.
+[[bench]]
+name = "bulletproofs_vs_groth16"
+harness = false
+required-features = ["prover"]
