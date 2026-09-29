@@ -123,8 +123,9 @@ fn neg_proj(p: G1Projective) -> G1Projective {
 
 use crate::poseidon2;
 
-/// A Fiat-Shamir transcript backed by a Poseidon2 sponge over BN254 Fr.
-struct Transcript {
+/// A Fiat-Shamir transcript state machine tailored for Bulletproofs.
+/// It uses a Poseidon2 sponge and enforces the correct order of absorption.
+pub struct TranscriptInit {
     sponge: poseidon2::Poseidon2Sponge,
 }
 
@@ -143,13 +144,21 @@ impl Transcript {
             sponge: poseidon2::Poseidon2Sponge::new(),
         }
     }
+}
 
-    #[allow(dead_code)]
-    fn absorb_scalar(&mut self, s: u256) {
-        self.sponge.absorb(&[s]);
+/// A generic transcript for batch verification weight generation.
+pub struct BatchTranscript {
+    sponge: poseidon2::Poseidon2Sponge,
+}
+
+impl BatchTranscript {
+    pub fn new() -> Self {
+        let mut sponge = poseidon2::Poseidon2Sponge::new();
+        sponge.absorb(&[poseidon2::hash_to_fq(b"soroban-bp-batch")]);
+        Self { sponge }
     }
 
-    fn absorb_point(&mut self, p: &G1Affine) {
+    pub fn absorb_point(&mut self, p: &G1Affine) {
         self.sponge.absorb(&[p.x, p.y]);
     }
 
@@ -483,6 +492,7 @@ fn ipa_prove(
     a0: [u256; N],
     b0: [u256; N],
     q: &G1Affine,
+    tr_ipa_init: TranscriptIPAInit,
 ) -> InnerProductProof {
     let mut g = g0;
     let mut h = h0;
@@ -492,8 +502,7 @@ fn ipa_prove(
     let mut l = [IDENTITY; IP_ROUNDS];
     let mut r = [IDENTITY; IP_ROUNDS];
 
-    let mut tr = Transcript::new();
-    tr.absorb_point(&p0);
+    let mut tr = tr_ipa_init.init_ipa(&p0);
 
     let mut n = N;
     let mut round = 0;
@@ -529,9 +538,7 @@ fn ipa_prove(
         l[round] = lp;
         r[round] = rp;
 
-        tr.absorb_point(&lp);
-        tr.absorb_point(&rp);
-        let x = tr.challenge();
+        let x = tr.challenge_round(&lp, &rp);
         let x_inv = f_inv(x);
         let x2 = f_mul(x, x);
         let x2_inv = f_mul(x_inv, x_inv);
@@ -571,6 +578,7 @@ fn ipa_fold(
     g0: [G1Affine; N],
     h0: [G1Affine; N],
     proof: &InnerProductProof,
+    tr_ipa_init: TranscriptIPAInit,
 ) -> (G1Projective, G1Affine, G1Affine, u256, u256) {
     let mut p = G1Projective::from(p0);
     let x_challenges = ipa_challenges(p0, proof);
@@ -592,7 +600,7 @@ fn ipa_fold(
     (p, g_fold, h_fold, proof.a, proof.b)
 }
 
-/// Verifies an inner-product argument.
+/// Verifier for testing `ipa_verify`
 #[cfg(test)]
 fn ipa_verify(
     p0: G1Affine,
@@ -601,7 +609,8 @@ fn ipa_verify(
     q: &G1Affine,
     proof: &InnerProductProof,
 ) -> bool {
-    let (p, g0f, h0f, a, b) = ipa_fold(p0, g0, h0, proof);
+    let tr_ipa = TranscriptIPAInit { sponge: poseidon2::Poseidon2Sponge::new() };
+    let (p, g0f, h0f, a, b) = ipa_fold(p0, g0, h0, proof, tr_ipa);
     let ab = f_mul(a, b);
     let mut target = G1Projective::from(g0f.scalar_mul(a));
     target = add_scaled(target, &h0f, b);
@@ -665,17 +674,11 @@ fn compute_p(
 
 /// Derives the range-proof Fiat-Shamir challenges `(y, z, x)` identically for
 /// prover and verifier.
-fn derive_challenges(proof: &RangeProof) -> (u256, u256, u256) {
-    let mut tr = Transcript::new();
-    tr.absorb_point(&proof.v);
-    tr.absorb_point(&proof.a);
-    tr.absorb_point(&proof.s);
-    let y = tr.challenge();
-    let z = tr.challenge();
-    tr.absorb_point(&proof.t1);
-    tr.absorb_point(&proof.t2);
-    let x = tr.challenge();
-    (y, z, x)
+fn derive_challenges(proof: &RangeProof) -> (u256, u256, u256, TranscriptIPAInit) {
+    let tr = TranscriptInit::new();
+    let (y, z, tr_ph2) = tr.commit_phase1(&proof.v, &proof.a, &proof.s);
+    let (x, tr_ipa) = tr_ph2.commit_phase2(&proof.t1, &proof.t2);
+    (y, z, x, tr_ipa)
 }
 
 // ===========================================================================
@@ -758,12 +761,8 @@ mod prover {
         };
         let v_pt = commit_value(gens, v, gamma);
 
-        let mut tr = Transcript::new();
-        tr.absorb_point(&v_pt);
-        tr.absorb_point(&a_pt);
-        tr.absorb_point(&s_pt);
-        let y = tr.challenge();
-        let z = tr.challenge();
+        let tr = TranscriptInit::new();
+        let (y, z, tr_ph2) = tr.commit_phase1(&v_pt, &a_pt, &s_pt);
 
         let mut y_vec = [u256::from(0u8); N];
         let mut yp = u256::from(1u8);
@@ -814,9 +813,7 @@ mod prover {
         )
         .to_affine();
 
-        tr.absorb_point(&t1_pt);
-        tr.absorb_point(&t2_pt);
-        let x = tr.challenge();
+        let (x, tr_ipa) = tr_ph2.commit_phase2(&t1_pt, &t2_pt);
 
         let mut l_x = [u256::from(0u8); N];
         let mut r_x = [u256::from(0u8); N];
@@ -831,7 +828,7 @@ mod prover {
 
         let p = compute_p(gens, &a_pt, &s_pt, y, z, x, t_hat, mu);
         let h_tilde = compute_h_tilde(&gens.h, y);
-        let ip_proof = ipa_prove(p, gens.g, h_tilde, l_x, r_x, &gens.h_blind);
+        let ip_proof = ipa_prove(p, gens.g, h_tilde, l_x, r_x, &gens.h_blind, tr_ipa);
 
         Ok(RangeProof {
             v: v_pt,
@@ -860,7 +857,7 @@ pub use prover::{commit_value, prove};
 /// * t-check:  `(t_hat - delta)*G + taux*H - x^2*T2 - x*T1 - z^2*V == 0`
 /// * ipa:      `P - a*gf - b*hf - (a*b)*H == 0`
 fn compute_residual(gens: &Generators, proof: &RangeProof) -> G1Projective {
-    let (y, z, x) = derive_challenges(proof);
+    let (y, z, x, tr_ipa) = derive_challenges(proof);
     let z2 = f_mul(z, z);
 
     // delta = (z - z^2) * (1 + y + ... + y^{n-1}) - z^3 * (2^n - 1)
@@ -887,7 +884,7 @@ fn compute_residual(gens: &Generators, proof: &RangeProof) -> G1Projective {
     // E2 (ipa residual)
     let p = compute_p(gens, &proof.a, &proof.s, y, z, x, proof.t_hat, proof.mu);
     let h_tilde = compute_h_tilde(&gens.h, y);
-    let (pf, gf, hf, a, b) = ipa_fold(p, gens.g, h_tilde, &proof.ip_proof);
+    let (pf, gf, hf, a, b) = ipa_fold(p, gens.g, h_tilde, &proof.ip_proof, tr_ipa);
     let mut target = G1Projective::from(gf.scalar_mul(a));
     target = add_scaled(target, &hf, b);
     target = add_scaled(target, &gens.h_blind, f_mul(a, b));
