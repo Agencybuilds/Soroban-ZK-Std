@@ -12,6 +12,7 @@ dist/
 target/
 **/target/
 /vendor/
+.toolchain/
 
 # Rust artifacts
 **/*.rlib

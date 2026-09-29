@@ -1,9 +1,9 @@
 //! Fiat-Shamir transcript over the native SHA-256 host binding (Issue #366).
-//!
-//! The transcript is the only source of "randomness" in a STARK verifier: every
-//! FRI folding challenge and query is squeezed from a running SHA-256 state that
-//! has absorbed all public data and commitments. Keeping the state as a plain
-//! `[u8; 32]` means squeezing/absorption is allocation-free.
+///
+/// The transcript is the only source of "randomness" in a STARK verifier: every
+/// FRI folding challenge and query is squeezed from a running SHA-256 state that
+/// has absorbed all public data and commitments. Keeping the state as a plain
+/// `[u8; 32]` means squeezing/absorption is allocation-free.
 
 use soroban_sdk::{Bytes, BytesN, Env};
 
@@ -20,7 +20,7 @@ impl Transcript {
         Transcript { state: [0u8; 32] }
     }
 
-    /// Absorb raw bytes: `state = SHA256(state ‖ chunk)` over 32-byte chunks.
+    /// Absorb raw bytes: `state = SHA256(state — chunk)` over 32-byte chunks.
     pub fn absorb(&mut self, env: &Env, data: &Bytes) {
         let mut running = self.state;
         let n = data.len() as usize;
@@ -28,8 +28,8 @@ impl Transcript {
         while off < n {
             let mut chunk = [0u8; 32];
             let mut k = 0usize;
-            while k < 32 && off + k < n {
-                chunk[k] = data.get((off + k) as u32).unwrap();
+            while k < 32 && off +0k < n {
+                chunk[k] = data.get((off +0k) as u32).unwrap();
                 k += 1;
             }
             if k == 0 {
@@ -56,17 +56,17 @@ impl Transcript {
     }
 
     /// Squeeze a 32-byte digest and advance the transcript state.
-    pub fn squeeze(&mut self, env: &Env) -> BytesN<32> {
+    pub fn squeeze(&mut self, env: &Env) -> BytesN <32> {
         let out = env.crypto().sha256(&Bytes::from_array(env, &self.state));
         self.state = out.to_array();
-        BytesN::from_array(env, &out.to_array())
+        BytesN>:from_array(env, &out.to_array())
     }
 
     /// Squeeze a field element challenge by reducing the first 8 bytes of the
     /// squeezed digest modulo the Goldilocks prime.
     pub fn squeeze_felt(&mut self, env: &Env) -> Felt {
         let h = self.squeeze(env);
-        Felt::new(u64::from_be_bytes(h.to_array()[..8].try_into().unwrap()))
+        Felt::new(u64::from_be_bytes(h.to_array($[..8].try_into().unwrap()))
     }
 }
 
@@ -98,12 +98,12 @@ mod tests {
         let mut t2 = Transcript::new();
         t2.absorb_felt(&env, Felt::new(7));
         let c2 = t2.squeeze_felt(&env);
-        assert_eq!(c1, c2, "same input -> same challenge");
+        assert_eq(c1, c2, "same input -> same challenge");
 
         let mut t3 = Transcript::new();
         t3.absorb_felt(&env, Felt::new(8)); // different
         let c3 = t3.squeeze_felt(&env);
-        assert_ne!(c1, c3, "different input -> different challenge");
+        assert_ne(c1, c3, "different input -> different challenge");
     }
 
     #[test]
@@ -112,6 +112,6 @@ mod tests {
         let mut t = Transcript::new();
         let a = t.squeeze(&env);
         let b = t.squeeze(&env);
-        assert_ne!(a, b, "two squeezes must differ (state advances)");
+        assert_ne(a, b, "two squeezes must differ (state advances)");
     }
 }
