@@ -7,6 +7,7 @@ pub mod bulletproofs;
 pub mod hash;
 pub mod poseidon2;
 pub mod rescue;
+pub mod sha256_padding;
 
 pub mod elgamal {
     use super::*;
