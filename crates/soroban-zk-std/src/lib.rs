@@ -17,8 +17,8 @@ pub use halo2::{Halo2StorageKey, LookupTable, PermutationKey};
 pub use pairing::{pairing_check, G2Affine};
 pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
-    vk_to_bytes, G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey, VkMeta, VkStorageKey,
-    VK_CHUNK_SIZE,
+    vk_to_bytes, G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey, VerificationContext, VkMeta,
+    VkStorageKey, VK_CHUNK_SIZE,
 };
 
 pub use rescue_prime::{
@@ -202,9 +202,20 @@ impl ZkContract {
     }
 
     /// Loads the stored verification key, verifies a Groth16 proof against it,
-    /// and clears the short-lived proof-context flag afterwards. Demonstrates
-    /// the Phase-3 cleanup pattern: the temporary flag is removed whether the
-    /// verification succeeds or fails.
+    /// and clears the short-lived proof-context flag afterwards.
+    ///
+    /// ## State-rollback safety (Issue #466)
+    /// A [`VerificationContext`] RAII guard is created immediately after the VK
+    /// is loaded.  The guard writes the proof-context marker to
+    /// `StorageType::Temporary` and **unconditionally** removes it when dropped
+    /// — even if deserialization fails, an invalid field element is detected,
+    /// or the pairing check returns an error.  This prevents partially-written
+    /// state from surviving a mid-verification failure.
+    ///
+    /// Deserialized public inputs are held in a
+    /// [`soroban_zk_core::zeroize::sensitive_vec::SensitiveVec`] so that the
+    /// raw scalar bytes are zero-filled via `write_volatile` before their
+    /// heap allocation is released.
     ///
     /// When `anti_replay` is `true` the verifier additionally records a
     /// SHA-256 commitment over `proof_bytes || public_inputs` in
@@ -236,26 +247,34 @@ impl ZkContract {
             let owned = vk::load_vk(&env)?;
             let vk = owned.as_vk();
 
-            // Mark the in-flight run with a temporary proof-context flag.
-            vk::set_proof_context(&env, &proof_bytes);
+            // ── State-rollback safety boundary (Issue #466) ──────────────────
+            // The RAII guard writes the proof-context marker and guarantees it
+            // is cleared when this closure exits — success, error, or `?`.
+            // Bind with a named variable (not `_`) so it lives until the end
+            // of the closure scope.
+            let _ctx = vk::VerificationContext::begin(&env, &proof_bytes);
 
-            let outcome = (|| {
-                let proof_buf: alloc::vec::Vec<u8> = proof_bytes.iter().collect();
-                let proof = Groth16Proof::from_bytes(&proof_buf)?;
-                let mut inputs: alloc::vec::Vec<eth_u256> =
-                    alloc::vec::Vec::with_capacity(public_inputs.len() as usize);
-                for input in public_inputs.iter() {
-                    let mut buf = [0u8; 32];
-                    input.to_be_bytes().copy_into_slice(&mut buf);
-                    inputs.push(eth_u256::from_be_bytes(buf));
-                }
-                groth16_verify(&env, &vk, &proof, &inputs)
-            })();
+            // Deserialise the proof.
+            let proof_buf: alloc::vec::Vec<u8> = proof_bytes.iter().collect();
+            let proof = Groth16Proof::from_bytes(&proof_buf)?;
 
-            // Always clear the proof-context flag (the Temporary entry also
-            // expires automatically).
-            vk::clear_proof_context(&env);
-            outcome
+            // Deserialise the public inputs into a SensitiveVec so the scalar
+            // bytes are zero-filled (via write_volatile) when the vector is
+            // dropped — regardless of whether verification succeeds or fails.
+            let mut raw_inputs: alloc::vec::Vec<eth_u256> =
+                alloc::vec::Vec::with_capacity(public_inputs.len() as usize);
+            for input in public_inputs.iter() {
+                let mut buf = [0u8; 32];
+                input.to_be_bytes().copy_into_slice(&mut buf);
+                raw_inputs.push(eth_u256::from_be_bytes(buf));
+            }
+            let sensitive_inputs =
+                soroban_zk_core::zeroize::sensitive_vec::SensitiveVec::new(raw_inputs);
+
+            // Run the pairing-based verifier.
+            // `sensitive_inputs` is dropped (and zeroed) at end of scope.
+            // `_ctx` is dropped at end of scope → clear_proof_context runs.
+            groth16_verify(&env, &vk, &proof, sensitive_inputs.as_slice())
         })();
 
         // ── Record nullifier only after a successful verification ──────────────
@@ -407,5 +426,82 @@ mod tests {
         assert!(client
             .try_halo2_range_lookup(&1, &15, &U256::from_u128(&env, 16))
             .is_err());
+    }
+
+    // ── State-rollback safety tests (Issue #466) ─────────────────────────────
+
+    /// After `verify_proof` returns (either success or a `StorageError` because
+    /// no VK is stored), the proof-context temporary entry must not persist.
+    ///
+    /// This test exercises the end-to-end contract path: no VK stored → the
+    /// verifier inner closure returns `ZkError::StorageError` via `load_vk`
+    /// before even creating the `VerificationContext`, so the temporary flag
+    /// should never have been written.
+    #[test]
+    fn verify_proof_leaves_no_temp_state_when_no_vk_stored() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let id = env.register(ZkContract, ());
+        let client = ZkContractClient::new(&env, &id);
+
+        // No VK stored → StorageError from load_vk, before VerificationContext is created.
+        let proof_bytes = Bytes::from_array(&env, &[0u8; 256]);
+        let inputs = soroban_sdk::vec![&env];
+        let result = client.try_verify_proof(&proof_bytes, &inputs, &false);
+        assert!(result.is_err(), "should fail because no VK is stored");
+
+        // The proof-context temporary flag must not have been set.
+        env.as_contract(&id, || {
+            assert!(
+                !env.storage()
+                    .temporary()
+                    .has(&vk::ProofContextKey::Active),
+                "no temp state must remain after a StorageError path"
+            );
+        });
+    }
+
+    /// When a stored VK exists but the proof bytes are structurally invalid
+    /// (wrong length), `verify_proof` must still clean up the proof-context
+    /// temporary entry that `VerificationContext::begin` wrote.
+    #[test]
+    fn verify_proof_clears_temp_state_on_deserialization_error() {
+        use vk::{G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey};
+
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let id = env.register(ZkContract, ());
+
+        // Store a minimal valid VK so load_vk succeeds.
+        env.as_contract(&id, || {
+            let ic = alloc::vec![G1_GENERATOR, G1_GENERATOR];
+            let owned = OwnedVerifyingKey {
+                alpha_g1: G1_GENERATOR,
+                beta_g2: G2_GENERATOR,
+                gamma_g2: G2_GENERATOR,
+                delta_g2: G2_GENERATOR,
+                ic,
+            };
+            vk::save_vk(&env, &owned.as_vk()).expect("save_vk must succeed");
+        });
+
+        let client = ZkContractClient::new(&env, &id);
+
+        // Submit a proof that is the wrong length → DeserializationError from
+        // Groth16Proof::from_bytes, which fires after VerificationContext::begin.
+        let bad_proof = Bytes::from_array(&env, &[0xFFu8; 128]); // wrong: must be 256 bytes
+        let inputs = soroban_sdk::vec![&env, U256::from_u128(&env, 1)];
+        let result = client.try_verify_proof(&bad_proof, &inputs, &false);
+        assert!(result.is_err(), "wrong-length proof must be rejected");
+
+        // Temporary storage must be clean — VerificationContext::drop must have run.
+        env.as_contract(&id, || {
+            assert!(
+                !env.storage()
+                    .temporary()
+                    .has(&vk::ProofContextKey::Active),
+                "VerificationContext must clear temp storage even after DeserializationError"
+            );
+        });
     }
 }
