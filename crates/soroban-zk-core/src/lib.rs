@@ -380,6 +380,7 @@ pub mod elgamal {
 pub use elgamal::ElGamalCiphertext;
 pub mod halo2;
 pub mod polynomial;
+pub mod plonk;
 pub use polynomial::{DensePolynomial, SparsePolynomial};
 
 /// Errors returned by zero-knowledge conversion and validation operations.
