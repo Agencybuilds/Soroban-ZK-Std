@@ -6,6 +6,7 @@ pub mod gadgets;
 pub mod groth16;
 pub mod halo2;
 pub mod host;
+pub mod nullifier;
 pub mod pairing;
 pub mod poseidon2;
 pub mod rescue_prime;
@@ -101,6 +102,13 @@ pub enum ZkContractError {
     StorageError = 5,
     /// A ZK constraint or gadget invariant was violated by the supplied witness.
     ConstraintUnsatisfied = 6,
+    /// A previously-accepted proof was submitted again (anti-replay protection).
+    ///
+    /// This error is returned by [`nullifier::NullifierStore::mark_spent`] (and
+    /// by [`ZkContract::verify_proof`] when `anti_replay` is `true`) if the
+    /// nullifier of the submitted proof + public inputs already exists in
+    /// `StorageType::Persistent`.
+    ReplayDetected = 7,
 }
 
 impl From<ZkError> for ZkContractError {
@@ -197,11 +205,33 @@ impl ZkContract {
     /// and clears the short-lived proof-context flag afterwards. Demonstrates
     /// the Phase-3 cleanup pattern: the temporary flag is removed whether the
     /// verification succeeds or fails.
+    ///
+    /// When `anti_replay` is `true` the verifier additionally records a
+    /// SHA-256 commitment over `proof_bytes || public_inputs` in
+    /// `StorageType::Persistent`.  Any attempt to re-submit the same proof
+    /// will return [`ZkContractError::ReplayDetected`] **before** running the
+    /// pairing check, eliminating the gas cost of a redundant verification.
     pub fn verify_proof(
         env: Env,
         proof_bytes: Bytes,
         public_inputs: Vec<U256>,
+        anti_replay: bool,
     ) -> Result<bool, ZkContractError> {
+        // ── Anti-replay check (fast-path: reject before the expensive pairing) ──
+        //
+        // We check *before* proof verification so a replayed proof never burns
+        // the gas budget for a pairing check.  The nullifier is committed to
+        // the full `proof_bytes || serialised_inputs` tuple, so the same proof
+        // with different public inputs remains a valid new submission.
+        if anti_replay {
+            let inputs_buf = nullifier::inputs_to_bytes(&env, &public_inputs);
+            let nstore = nullifier::NullifierStore::new(&env);
+            // If spent → early return, no state change.
+            if nstore.is_spent(&env, &proof_bytes, &inputs_buf) {
+                return Err(ZkContractError::ReplayDetected);
+            }
+        }
+
         let result: Result<bool, ZkError> = (|| {
             let owned = vk::load_vk(&env)?;
             let vk = owned.as_vk();
@@ -227,6 +257,23 @@ impl ZkContract {
             vk::clear_proof_context(&env);
             outcome
         })();
+
+        // ── Record nullifier only after a successful verification ──────────────
+        //
+        // We write the nullifier *after* verification so that a proof that
+        // fails on-chain (bad pairing, invalid inputs, …) is not burned in the
+        // nullifier set — the submitter would lose the ability to re-submit a
+        // corrected proof if we wrote before.  Only an accepted proof (one that
+        // returns `Ok(true)`) is recorded as spent.
+        if anti_replay {
+            if let Ok(true) = result {
+                let inputs_buf = nullifier::inputs_to_bytes(&env, &public_inputs);
+                let nstore = nullifier::NullifierStore::new(&env);
+                nstore.mark_spent(&env, &proof_bytes, &inputs_buf)
+                    .map_err(|_| ZkContractError::StorageError)?;
+            }
+        }
+
         result.map_err(ZkContractError::from)
     }
 }
