@@ -12,6 +12,7 @@ pub mod pairing;
 pub mod plonk_kzg;
 pub mod poseidon2;
 pub mod rescue_prime;
+pub mod telemetry;
 pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
