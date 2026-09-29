@@ -684,7 +684,7 @@ impl Poseidon2Sponge {
     pub fn absorb(&mut self, inputs: &[U256]) {
         for input in inputs {
             let cur = self.state.get(self.rate_idx).unwrap();
-            let next = field_add(&self.env, &cur, input, &self.modulus);
+            let next = field_add(&cur, input, &self.modulus);
             self.state.set(self.rate_idx, next);
             self.rate_idx += 1;
             if self.rate_idx == RATE {
@@ -841,7 +841,7 @@ mod tests {
         let a = modulus.clone().sub(&U256::from_u128(&env, 1));
         let b = U256::from_u128(&env, 2);
 
-        let result = field_add(&env, &a, &b, &modulus);
+        let result = field_add(&a, &b, &modulus);
 
         assert_eq!(result, U256::from_u128(&env, 1));
     }
@@ -862,7 +862,7 @@ mod tests {
         let b = max.sub(&U256::from_u128(&env, 2));
 
         // Must not panic and must return a properly reduced field element.
-        let result = field_add(&env, &a, &b, &modulus);
+        let result = field_add(&a, &b, &modulus);
 
         // Cross-check the expected value in ethnum space (reduce each operand
         // first so the addition is in-range, exactly as field_add does).
