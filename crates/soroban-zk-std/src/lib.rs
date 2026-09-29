@@ -4,12 +4,14 @@ extern crate alloc;
 pub mod cache;
 pub mod gadgets;
 pub mod groth16;
+pub mod halo2;
 pub mod host;
 pub mod pairing;
 pub mod poseidon2;
 pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
+pub use halo2::{Halo2StorageKey, LookupTable, PermutationKey};
 pub use pairing::{pairing_check, G2Affine};
 pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
@@ -133,6 +135,33 @@ impl ZkContract {
             sponge.absorb(core::slice::from_ref(&input));
         }
         sponge.squeeze()
+    }
+
+    /// Returns the Halo2 permutation key (`sigma`) for a `rows × cols` grid,
+    /// lazily initialising it in `StorageType::Instance` on first use so that
+    /// subsequent contract calls read the cached key instead of rebuilding it.
+    pub fn halo2_permutation_key(
+        env: Env,
+        rows: u32,
+        cols: u32,
+    ) -> Result<Vec<u32>, ZkContractError> {
+        let key = halo2::get_or_init_permutation_key(&env, rows, cols)
+            .map_err(ZkContractError::from)?;
+        Ok(key.sigma)
+    }
+
+    /// Lazily builds the range-check lookup table `[0, max] -> 1`, caches it in
+    /// `StorageType::Instance` under `id`, then returns the table output for
+    /// `value` (a membership proof that `value <= max`).
+    pub fn halo2_range_lookup(
+        env: Env,
+        id: u32,
+        max: u32,
+        value: U256,
+    ) -> Result<U256, ZkContractError> {
+        let lut = halo2::get_or_init_range_lookup_table(&env, id, max)
+            .map_err(ZkContractError::from)?;
+        lut.lookup(&[value]).map_err(ZkContractError::from)
     }
 
     /// Persists a verification key (serialized via [`vk::vk_to_bytes`]) to
@@ -271,5 +300,60 @@ mod tests {
             assert!(store.has(&cache::ConstantKey::Poseidon2MatDiag));
             assert!(store.has(&cache::ConstantKey::FrModulus));
         });
+    }
+
+    #[test]
+    fn halo2_permutation_key_is_cached_across_calls() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let id = env.register(ZkContract, ());
+        let client = ZkContractClient::new(&env, &id);
+
+        // First call lazily populates the instance cache with the identity key.
+        let first = client.halo2_permutation_key(&2, &3);
+        assert_eq!(first.len(), 6);
+        env.as_contract(&id, || {
+            assert!(env
+                .storage()
+                .instance()
+                .has(&halo2::Halo2StorageKey::PermutationKey(2, 3)));
+        });
+
+        // Second call reads the cached key and returns identical data.
+        let second = client.halo2_permutation_key(&2, &3);
+        assert_eq!(second.len(), first.len());
+        for i in 0..first.len() {
+            assert_eq!(second.get(i).unwrap(), first.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn halo2_range_lookup_uses_instance_cache() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let id = env.register(ZkContract, ());
+        let client = ZkContractClient::new(&env, &id);
+
+        let one = U256::from_u128(&env, 1);
+        // First call caches the range table; both bounds map to 1.
+        assert_eq!(
+            client.halo2_range_lookup(&1, &15, &U256::from_u128(&env, 7)),
+            one
+        );
+        env.as_contract(&id, || {
+            assert!(env
+                .storage()
+                .instance()
+                .has(&halo2::Halo2StorageKey::LookupTable(1)));
+        });
+
+        // Cache hit: an in-range value still resolves, an out-of-range one fails.
+        assert_eq!(
+            client.halo2_range_lookup(&1, &15, &U256::from_u128(&env, 15)),
+            one
+        );
+        assert!(client
+            .try_halo2_range_lookup(&1, &15, &U256::from_u128(&env, 16))
+            .is_err());
     }
 }
