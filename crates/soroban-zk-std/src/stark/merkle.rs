@@ -90,6 +90,9 @@ impl MerklePath {
 
     /// Verify that `leaf` sits at `index` in the tree with Merkle `root`.
     pub fn verify(&self, env: &Env, leaf: &BytesN<32>, root: &BytesN<32>) -> bool {
+        if self.depth > MAX_DEPTH {
+            return false;
+        }
         &self.compute_root(env, leaf) == root
     }
 }
@@ -215,6 +218,9 @@ impl DeepMerklePath {
 
     /// Verify that `leaf` sits at `index` in the tree with the given `root`.
     pub fn verify(&self, env: &Env, leaf: &BytesN<32>, root: &BytesN<32>) -> bool {
+        if self.depth > DEEP_MAX_DEPTH {
+            return false;
+        }
         &self.compute_root(env, leaf) == root
     }
 
@@ -285,6 +291,9 @@ impl CompactMerklePath {
 
     /// Verify that `leaf` sits at `index` in the tree with the given `root`.
     pub fn verify(&self, env: &Env, leaf: &BytesN<32>, root: &BytesN<32>) -> bool {
+        if self.depth > COMPACT_MAX_DEPTH as u32 {
+            return false;
+        }
         &self.compute_root(env, leaf) == root
     }
 
@@ -886,5 +895,164 @@ impl MerklePath {
             depth: self.depth,
             index: self.index,
         }
+    }
+}
+
+/// Host-limit tests for deep Merkle validation (issue #462).
+///
+/// `depth` arrives inside proof data, so these tests treat it as hostile
+/// input: a claimed depth of 64 must terminate — bounded by the array,
+/// never a Wasm trap or an unbounded host-call loop — and the deepest
+/// *legitimate* path (`COMPACT_MAX_DEPTH`, a 2^64-leaf tree) must fit
+/// comfortably inside one transaction's Soroban budget.
+#[cfg(test)]
+mod limit_tests {
+    extern crate std;
+    use super::*;
+    use soroban_sdk::Env;
+
+    /// Current mainnet per-transaction Soroban resource limits, which are
+    /// also what `budget().reset_default()` configures in the SDK test host:
+    /// 100M CPU instructions, 40 MiB of Wasm linear memory.
+    const TX_CPU_INSNS_LIMIT: u64 = 100_000_000;
+    const TX_MEM_BYTES_LIMIT: u64 = 40 * 1024 * 1024;
+
+    /// A synthetic path of `depth` levels with distinct sibling digests. Trees
+    /// this deep cannot be *built* in a test (depth 64 implies 2^64
+    /// leaves), so limits are exercised on the verification fold — the only
+    /// side that ever runs on-chain.
+    fn synthetic_compact_path(depth: u32) -> CompactMerklePath {
+        let mut siblings = [[0u8; 32]; COMPACT_MAX_DEPTH];
+        for (i, s) in siblings.iter_mut().enumerate() {
+            s[0] = i as u8 + 1;
+            s[31] = 0xa5;
+        }
+        CompactMerklePath {
+            siblings,
+            depth,
+            index: u64::MAX >> 1, // exercise both left/right orderings
+        }
+    }
+
+    /// CPU and memory consumed by one `verify` call at the given claimed
+    /// depth, measured against the DEFAULT (network-shaped) budget — not the
+    /// unlimited one — so exhaustion would fail the test loudly.
+    fn measured_verify(env: &Env, depth: u32, root: &BytesN<32>) -> (bool, u64, u64) {
+        let path = synthetic_compact_path(depth);
+        let leaf = BytesN::from_array(env, &[0x11u8; 32]);
+        let mut budget = env.cost_estimate().budget();
+        budget.reset_default();
+        let ok = path.verify(env, &leaf, root);
+        let budget = env.cost_estimate().budget();
+        (
+            ok,
+            budget.cpu_instruction_cost(),
+            budget.memory_bytes_cost(),
+        )
+    }
+
+    /// The root the synthetic path at `depth` folds to (computed once under
+    /// an unlimited budget; correctness of the fold itself is covered by the
+    /// `open()`-based tests above — these tests are about resource bounds).
+    fn root_for(env: &Env, depth: u32) -> BytesN<32> {
+        env.cost_estimate().budget().reset_unlimited();
+        let leaf = BytesN::from_array(env, &[0x11u8; 32]);
+        synthetic_compact_path(depth).compute_root(env, &leaf)
+    }
+
+    #[test]
+    fn max_depth_verify_fits_the_transaction_budget_with_headroom() {
+        let env = Env::default();
+        let root = root_for(&env, COMPACT_MAX_DEPTH as u32);
+
+        let (ok, cpu, mem) = measured_verify(&env, COMPACT_MAX_DEPTH as u32, &root);
+        assert!(ok, "a full-depth ({COMPACT_MAX_DEPTH}) path must verify");
+
+        // The deepest legitimate check is COMPACT_MAX_DEPTH host sha256 calls. It must
+        // not merely squeak under the per-transaction ceiling — a verifier
+        // consuming a large fraction of the budget leaves nothing for the
+        // surrounding STARK checks. Require an order of magnitude of headroom.
+        assert!(
+            cpu < TX_CPU_INSNS_LIMIT / 10,
+            "depth-{COMPACT_MAX_DEPTH} verify used {cpu} CPU insns — more than 10% of the {TX_CPU_INSNS_LIMIT} tx limit"
+        );
+        assert!(
+            mem < TX_MEM_BYTES_LIMIT / 10,
+            "depth-{COMPACT_MAX_DEPTH} verify used {mem} bytes — more than 10% of the {TX_MEM_BYTES_LIMIT} tx limit"
+        );
+    }
+
+    #[test]
+    fn cost_grows_linearly_with_depth_not_worse() {
+        let env = Env::default();
+        // Per-depth roots so every verify actually folds its full claimed depth.
+        let r16 = root_for(&env, 16);
+        let r32 = root_for(&env, 32);
+        let r64 = root_for(&env, 64);
+
+        let (ok16, cpu16, _) = measured_verify(&env, 16, &r16);
+        let (ok32, cpu32, _) = measured_verify(&env, 32, &r32);
+        let (ok64, cpu64, _) = measured_verify(&env, 64, &r64);
+        assert!(ok16 && ok32 && ok64);
+
+        // Doubling the depth may at most roughly double the cost (plus a
+        // fixed per-call overhead). Superlinear growth here would be the
+        // early warning that deep trees hit the ceiling before COMPACT_MAX_DEPTH.
+        assert!(
+            cpu32 <= cpu16.saturating_mul(2) + cpu16,
+            "16→32 grew worse than linearly: {cpu16} → {cpu32}"
+        );
+        assert!(
+            cpu64 <= cpu32.saturating_mul(2) + cpu16,
+            "32→64 grew worse than linearly: {cpu32} → {cpu64}"
+        );
+    }
+
+    #[test]
+    fn hostile_depth_beyond_max_terminates_bounded_and_rejects() {
+        let env = Env::default();
+        let honest_root = root_for(&env, COMPACT_MAX_DEPTH as u32);
+        let (_, cpu_at_max, _) = measured_verify(&env, COMPACT_MAX_DEPTH as u32, &honest_root);
+
+        for hostile_depth in [COMPACT_MAX_DEPTH as u32 + 1, 128, 256, u32::MAX] {
+            let (ok, cpu, mem) = measured_verify(&env, hostile_depth, &honest_root);
+            assert!(
+                !ok,
+                "a path claiming depth {hostile_depth} (> COMPACT_MAX_DEPTH) must never verify"
+            );
+            // Termination bound: rejection must cost no more than an honest
+            // full-depth fold — the claimed depth must not buy the caller a
+            // single extra host call, let alone a budget-exhausting loop.
+            assert!(
+                cpu <= cpu_at_max,
+                "depth {hostile_depth} spent {cpu} CPU insns, more than an honest depth-{COMPACT_MAX_DEPTH} verify ({cpu_at_max}) — the loop is not bounded"
+            );
+            assert!(mem < TX_MEM_BYTES_LIMIT / 10);
+        }
+    }
+
+    #[test]
+    fn depth_boundary_is_exact() {
+        let env = Env::default();
+
+        // depth == COMPACT_MAX_DEPTH: legitimate and accepted.
+        let root = root_for(&env, COMPACT_MAX_DEPTH as u32);
+        let (ok, _, _) = measured_verify(&env, COMPACT_MAX_DEPTH as u32, &root);
+        assert!(ok, "depth == COMPACT_MAX_DEPTH is the deepest legitimate path");
+
+        // depth == COMPACT_MAX_DEPTH + 1: rejected even against the root its own
+        // COMPACT_MAX_DEPTH-prefix folds to — an oversized claim must not pass by
+        // matching a truncated fold of itself.
+        let truncated_root = root_for(&env, COMPACT_MAX_DEPTH as u32); // prefix fold == depth-64 fold
+        let path = synthetic_compact_path(COMPACT_MAX_DEPTH as u32 + 1);
+        let leaf = BytesN::from_array(&env, &[0x11u8; 32]);
+        {
+            let mut b = env.cost_estimate().budget();
+            b.reset_default();
+        }
+        assert!(
+            !path.verify(&env, &leaf, &truncated_root),
+            "an oversized depth must be rejected outright, not clamped into passing"
+        );
     }
 }
