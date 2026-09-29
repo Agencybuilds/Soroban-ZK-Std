@@ -6,6 +6,7 @@ extern crate self as zk_core;
 pub mod bulletproofs;
 pub mod hash;
 pub mod poseidon2;
+pub mod rescue;
 
 pub mod elgamal {
     use super::*;
@@ -382,6 +383,9 @@ pub mod halo2;
 pub mod halo2_ipa;
 pub mod polynomial;
 pub use polynomial::{DensePolynomial, SparsePolynomial};
+pub use ipa_generators::{
+    commit_generators, ct_select_affine, fold_generators, fold_generators_rounds, GeneratorVec,
+};
 
 /// Errors returned by zero-knowledge conversion and validation operations.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

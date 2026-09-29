@@ -2,233 +2,69 @@
 //!
 //! Implements the Rescue-Prime sponge permutation over the BN254 scalar field
 //! `Fr` in pure software (no host call), so the same constraints can be
-//! evaluated in-circuit by a prover and re-checked by a verifier. The S-box is
-//! `x^α` with `α` an odd exponent coprime to `p-1`; its inverse `x^{α⁻¹}` is
-//! provided so that the permutation is (partially) invertible and the S-box
-//! inverse algorithm is exercised directly.
+//! evaluated in-circuit by a prover and re-checked by a verifier.
 //!
-//! Field arithmetic uses [`soroban_zk_core::Bn254`], which operates on
-//! [`ethnum::u256`] modulo the BN254 Fr modulus.
+//! The linear layer (MDS matrix-vector multiply) is now delegated entirely to
+//! [`soroban_zk_core::rescue`], which provides:
+//! - [`soroban_zk_core::rescue::MdsMat`] — the Cauchy MDS matrix type
+//! - [`soroban_zk_core::rescue::mds_multiply`] — constant-time matrix-vector multiply
+//! - [`soroban_zk_core::rescue::RescuePrimeCore`] — full permutation with pre-built params
+//!
+//! This file provides the Soroban-SDK-aware sponge wrapper that absorbs
+//! [`soroban_sdk::U256`] inputs and returns a digest.
 
 use ethnum::u256 as eth_u256;
-use soroban_sdk::{Bytes, Env, U256, Vec};
-use soroban_zk_core::Bn254;
+use soroban_sdk::{Bytes, Env, U256};
+use soroban_zk_core::{Bn254, rescue::RescuePrimeCore};
 
-/// State width `m`. Rate = `m - 1`, capacity = `1`.
-pub const STATE: usize = 3;
-/// Number of permutation rounds (must be even).
-pub const ROUNDS: usize = 6;
-
-const FR: eth_u256 = Bn254::FR_MODULUS;
-
+/// Thin constant-time field addition alias (delegates to `Bn254::add`).
 #[inline(always)]
 fn fadd(a: eth_u256, b: eth_u256) -> eth_u256 {
     Bn254::add(a, b)
 }
-#[inline(always)]
-fn fsub(a: eth_u256, b: eth_u256) -> eth_u256 {
-    Bn254::sub(a, b)
-}
-#[inline(always)]
-fn fmul(a: eth_u256, b: eth_u256) -> eth_u256 {
-    Bn254::mul(a, b)
-}
-#[inline(always)]
-fn finv(a: eth_u256) -> eth_u256 {
-    Bn254::invert(a)
-}
-#[inline(always)]
-fn fpow(a: eth_u256, e: eth_u256) -> eth_u256 {
-    Bn254::pow(a, e)
-}
 
-/// Pick a valid S-box exponent `α` (odd, coprime to `p-1`) and its inverse.
-fn sbox_exponents() -> (eth_u256, eth_u256) {
-    // p-1 for the BN254 scalar field.
-    let pm1 = FR - eth_u256::ONE;
-    let mut alpha = eth_u256::from(3u8);
-    loop {
-        if gcd(alpha, pm1) == eth_u256::ONE {
-            let inv = mod_inv(alpha, pm1);
-            return (alpha, inv);
-        }
-        alpha += eth_u256::from(2u8); // stay odd
-    }
-}
+/// Re-export the state width constant from the core crate.
+pub use soroban_zk_core::rescue::STATE;
+/// Re-export the round count from the core crate.
+pub use soroban_zk_core::rescue::ROUNDS;
 
-fn gcd(mut a: eth_u256, mut b: eth_u256) -> eth_u256 {
-    while b != eth_u256::ZERO {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
-/// `(a + b) mod m` without overflow (a, b < m < 2^254 ⇒ sum < 2^255).
-fn add_mod(a: eth_u256, b: eth_u256, m: eth_u256) -> eth_u256 {
-    let s = a + b;
-    s % m
-}
-
-/// `(a − b) mod m`, keeping the result in `[0, m)`.
-fn sub_mod(a: eth_u256, b: eth_u256, m: eth_u256) -> eth_u256 {
-    if a >= b {
-        (a - b) % m
-    } else {
-        (m - (b - a)) % m
-    }
-}
-
-/// `(a · b) mod m` using double-and-add so intermediate products stay in `u256`
-/// (`m < 2^254`, `a·b` could be up to `2^508`).
-fn mul_mod(a: eth_u256, b: eth_u256, m: eth_u256) -> eth_u256 {
-    let mut res = eth_u256::ZERO;
-    let mut x = a % m;
-    for bit in (0..256).rev() {
-        res = (res << 1) % m;
-        if (x >> bit) & eth_u256::ONE == eth_u256::ONE {
-            res = add_mod(res, b, m);
-        }
-    }
-    res
-}
-
-/// Modular inverse of `a` modulo `m` (extended Euclidean with modular reduction
-/// so the Bézout coefficient never goes negative). `m` need not be prime.
-fn mod_inv(mut a: eth_u256, mut m: eth_u256) -> eth_u256 {
-    a %= m;
-    let (mut t, mut newt) = (eth_u256::ZERO, eth_u256::ONE);
-    let (mut r, mut newr) = (m, a);
-    while newr != eth_u256::ZERO {
-        let q = r / newr;
-        let tmp = t;
-        t = newt;
-        newt = sub_mod(tmp, mul_mod(q, newt, m), m);
-        let tmp_r = r;
-        r = newr;
-        newr = tmp_r - q * newr; // r >= q·newr, so this is non-negative and < m
-    }
-    // r must be 1 (a is coprime to m).
-    t % m
-}
-
-/// Rescue-Prime parameters: MDS matrix and round keys (Cauchy MDS, LCG round keys).
+/// Rescue-Prime parameters: a thin wrapper around [`RescuePrimeCore`] that
+/// exposes the Soroban-facing API used by the rest of the gadget suite.
+///
+/// The MDS linear layer is fully delegated to
+/// [`soroban_zk_core::rescue::mds_multiply`].
 pub struct RescueParams {
-    mds: [[eth_u256; STATE]; STATE],
-    round_keys: [[eth_u256; STATE]; ROUNDS],
+    core: RescuePrimeCore,
 }
 
 impl RescueParams {
     /// Build the fixed (deterministic) parameter set.
     pub fn new() -> Self {
-        let mds = build_mds();
-        let round_keys = build_round_keys();
-        Self { mds, round_keys }
-    }
-
-    /// Build from pre-computed cached values (for instance storage caching).
-    pub fn from_cached(
-        _env: &Env,
-        mds: Vec<Vec<U256>>,
-        round_keys: Vec<Vec<U256>>,
-    ) -> Self {
-        let mut mds_arr = [[eth_u256::ZERO; STATE]; STATE];
-        for i in 0..STATE {
-            for j in 0..STATE {
-                mds_arr[i][j] = to_eth_v(&mds.get(i).unwrap().get(j).unwrap());
-            }
-        }
-        let mut rk_arr = [[eth_u256::ZERO; STATE]; ROUNDS];
-        for r in 0..ROUNDS {
-            for j in 0..STATE {
-                rk_arr[r][j] = to_eth_v(&round_keys.get(r).unwrap().get(j).unwrap());
-            }
-        }
         Self {
-            mds: mds_arr,
-            round_keys: rk_arr,
+            core: RescuePrimeCore::new(),
         }
     }
 
-    /// Apply the `α`-th power S-box to a single element.
+    /// Apply the forward S-box (`x^α`).
+    #[inline(always)]
     pub fn sbox(&self, x: eth_u256) -> eth_u256 {
-        let (alpha, _) = sbox_exponents();
-        fpow(x, alpha)
+        self.core.sbox_fwd(x)
     }
 
-    /// Apply the S-box inverse (`x^{α⁻¹}`).
+    /// Apply the inverse S-box (`x^{α⁻¹}`).
+    #[inline(always)]
     pub fn sbox_inv(&self, x: eth_u256) -> eth_u256 {
-        let (_, alpha_inv) = sbox_exponents();
-        fpow(x, alpha_inv)
+        self.core.sbox_inv(x)
     }
 
-    /// One Rescue-Prime permutation of the `m`-element state.
+    /// One Rescue-Prime permutation of the `STATE`-element state.
+    ///
+    /// Delegates the MDS linear layer to
+    /// [`soroban_zk_core::rescue::mds_multiply`] via the pre-built
+    /// [`MdsMat`] stored inside [`RescuePrimeCore`].
     pub fn permute(&self, state: &mut [eth_u256; STATE]) {
-        let (alpha, alpha_inv) = sbox_exponents();
-        for r in 0..ROUNDS {
-            // S-box (forward on even rounds, inverse on odd rounds).
-            for i in 0..STATE {
-                state[i] = if r % 2 == 0 {
-                    fpow(state[i], alpha)
-                } else {
-                    fpow(state[i], alpha_inv)
-                };
-            }
-            // Add round key.
-            let key = &self.round_keys[r];
-            for i in 0..STATE {
-                state[i] = fadd(state[i], key[i]);
-            }
-            // MDS linear layer.
-            let mut out = [eth_u256::ZERO; STATE];
-            for i in 0..STATE {
-                let mut acc = eth_u256::ZERO;
-                for j in 0..STATE {
-                    acc = fadd(acc, fmul(self.mds[i][j], state[j]));
-                }
-                out[i] = acc;
-            }
-            *state = out;
-        }
+        self.core.permute(state);
     }
-}
-
-/// Build a Cauchy MDS matrix `M[i][j] = 1/(x_i - y_j)` with distinct sequences,
-/// which is guaranteed invertible.
-fn build_mds() -> [[eth_u256; STATE]; STATE] {
-    let mut mds = [[eth_u256::ZERO; STATE]; STATE];
-    for i in 0..STATE {
-        let xi = eth_u256::from(i as u128 + 1);
-        for j in 0..STATE {
-            // y_j = m + j + 1  → ensures x_i - y_j is never zero.
-            let yj = eth_u256::from(STATE as u128 + j as u128 + 1);
-            let mut diff = fsub(xi, yj);
-            if diff >= FR {
-                diff = fsub(diff, FR);
-            }
-            mds[i][j] = finv(diff);
-        }
-    }
-    mds
-}
-
-/// Deterministic round keys from a small LCG seeded by a constant.
-fn build_round_keys() -> [[eth_u256; STATE]; ROUNDS] {
-    let mut keys = [[eth_u256::ZERO; STATE]; ROUNDS];
-    // LCG parameters (arbitrary but fixed); result is mod Fr.
-    let a: eth_u256 = eth_u256::from(0x9E3779B97F4A7C15u64);
-    let c: eth_u256 = eth_u256::from(0x4F1BBCDCBFD3A8A7u64);
-    let mut state = eth_u256::from(0x1234_5678_9ABC_DEF1u64);
-    for r in 0..ROUNDS {
-        let mut row = [eth_u256::ZERO; STATE];
-        for j in 0..STATE {
-            state = fadd(fmul(state, a), c);
-            row[j] = state;
-        }
-        keys[r] = row;
-    }
-    keys
 }
 
 /// Rescue-Prime sponge hash over BN254 Fr.
