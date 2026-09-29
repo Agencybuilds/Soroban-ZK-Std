@@ -387,7 +387,7 @@ pub mod elgamal {
 pub use elgamal::ElGamalCiphertext;
 pub mod halo2;
 pub mod halo2_ipa;
-pub mod halo2_ipa_wrappers;
+pub mod halo2_ipa_batch;
 pub mod ipa_generators;
 pub mod plonk;
 pub mod polynomial;
