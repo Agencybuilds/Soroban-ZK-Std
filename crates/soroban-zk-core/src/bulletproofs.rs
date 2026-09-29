@@ -290,6 +290,187 @@ pub struct RangeProof {
 }
 
 // ===========================================================================
+// BulletproofProof — self-contained proof + generator mapping (issue #442)
+// ===========================================================================
+
+/// A fully self-contained Bulletproof that binds the range proof to the
+/// orthogonal generator sets used during proving and verification.
+///
+/// # Motivation
+///
+/// [`RangeProof`] and [`Generators`] are independent types: a `RangeProof`
+/// carries the cryptographic witness data while `Generators` holds the
+/// vector commitment bases and blinding point. Callers must always pass
+/// them together to [`verify`] or [`verify_batch`]. `BulletproofProof`
+/// bundles both into a single struct so that a proof can be parsed,
+/// serialised, and verified without tracking the generators separately.
+///
+/// # Layout
+///
+/// | Field        | Description |
+/// |-------------|-------------|
+/// | `generators` | The orthogonal generator sets `g`, `h`, and blinding base `H`. |
+/// | `proof`      | The range proof (commitments, L/R rounds, final scalars). |
+///
+/// # Example (with `prover` feature)
+///
+/// ```ignore
+/// let bp = BulletproofProof::new(proof, generators);
+/// assert!(bp.verify());
+/// ```
+#[derive(Clone, Copy)]
+pub struct BulletproofProof {
+    /// The orthogonal generator sets (`g[0..N]`, `h[0..N]`, `h_blind`)
+    /// against which the proof was computed.
+    pub generators: Generators,
+    /// The 64-bit range proof containing vector commitments (`A`, `S`),
+    /// polynomial commitments (`T1`, `T2`), the blinding scalars (`taux`,
+    /// `mu`), the evaluation `t_hat`, and the inner-product argument with
+    /// `L`/`R` round points and the final scalars `a`, `b`.
+    pub proof: RangeProof,
+}
+
+impl BulletproofProof {
+    /// Construct a new `BulletproofProof` from an existing proof and its
+    /// generator set.
+    pub fn new(proof: RangeProof, generators: Generators) -> Self {
+        Self { generators, proof }
+    }
+
+    /// Verify this Bulletproof against its embedded generators.
+    ///
+    /// Returns `true` iff the range proof is valid with respect to the
+    /// stored generator set.
+    pub fn verify(&self) -> bool {
+        verify(&self.generators, &self.proof)
+    }
+
+    /// Returns a read-only reference to the inner-product proof
+    /// (the `L`/`R` round points and final scalars `a`, `b`).
+    pub fn ip_proof(&self) -> &InnerProductProof {
+        &self.proof.ip_proof
+    }
+
+    /// Returns a read-only reference to the underlying [`RangeProof`].
+    pub fn range_proof(&self) -> &RangeProof {
+        &self.proof
+    }
+
+    /// Returns a read-only reference to the [`Generators`].
+    pub fn gens(&self) -> &Generators {
+        &self.generators
+    }
+
+    /// Returns the Pedersen commitment `V = v*G + gamma*H` that this proof
+    /// attests is a commitment to a 64-bit value.
+    pub fn commitment(&self) -> G1Affine {
+        self.proof.v
+    }
+
+    /// Returns the `L` round points from the inner-product argument.
+    pub fn l_vec(&self) -> &[G1Affine; IP_ROUNDS] {
+        &self.proof.ip_proof.l
+    }
+
+    /// Returns the `R` round points from the inner-product argument.
+    pub fn r_vec(&self) -> &[G1Affine; IP_ROUNDS] {
+        &self.proof.ip_proof.r
+    }
+
+    /// Returns the final scalar `a` from the inner-product argument.
+    pub fn final_a(&self) -> u256 {
+        self.proof.ip_proof.a
+    }
+
+    /// Returns the final scalar `b` from the inner-product argument.
+    pub fn final_b(&self) -> u256 {
+        self.proof.ip_proof.b
+    }
+
+    /// Returns the orthogonal `g`-vector generators.
+    pub fn g_generators(&self) -> &[G1Affine; N] {
+        &self.generators.g
+    }
+
+    /// Returns the orthogonal `h`-vector generators.
+    pub fn h_generators(&self) -> &[G1Affine; N] {
+        &self.generators.h
+    }
+
+    /// Returns the Pedersen blinding base `H`.
+    pub fn blinding_generator(&self) -> G1Affine {
+        self.generators.h_blind
+    }
+}
+
+/// A borrowed view of a Bulletproof binding a [`RangeProof`] reference to a
+/// [`Generators`] reference, avoiding copies of the large generator arrays
+/// when the caller already owns the data.
+#[derive(Clone, Copy)]
+pub struct BulletproofProofRef<'a> {
+    /// The orthogonal generator sets used for this proof.
+    pub generators: &'a Generators,
+    /// The range proof data.
+    pub proof: &'a RangeProof,
+}
+
+impl<'a> BulletproofProofRef<'a> {
+    /// Create a borrowed view binding a proof to its generators.
+    pub fn new(proof: &'a RangeProof, generators: &'a Generators) -> Self {
+        Self { generators, proof }
+    }
+
+    /// Verify this Bulletproof against its referenced generators.
+    pub fn verify(&self) -> bool {
+        verify(self.generators, self.proof)
+    }
+
+    /// Returns the Pedersen commitment `V`.
+    pub fn commitment(&self) -> G1Affine {
+        self.proof.v
+    }
+
+    /// Returns the `L` round points.
+    pub fn l_vec(&self) -> &[G1Affine; IP_ROUNDS] {
+        &self.proof.ip_proof.l
+    }
+
+    /// Returns the `R` round points.
+    pub fn r_vec(&self) -> &[G1Affine; IP_ROUNDS] {
+        &self.proof.ip_proof.r
+    }
+
+    /// Returns the final scalars `(a, b)`.
+    pub fn final_scalars(&self) -> (u256, u256) {
+        (self.proof.ip_proof.a, self.proof.ip_proof.b)
+    }
+
+    /// Returns the orthogonal `g`-vector generators.
+    pub fn g_generators(&self) -> &[G1Affine; N] {
+        &self.generators.g
+    }
+
+    /// Returns the orthogonal `h`-vector generators.
+    pub fn h_generators(&self) -> &[G1Affine; N] {
+        &self.generators.h
+    }
+
+    /// Returns the Pedersen blinding base `H`.
+    pub fn blinding_generator(&self) -> G1Affine {
+        self.generators.h_blind
+    }
+
+    /// Promote to an owned [`BulletproofProof`] by copying both the proof
+    /// and the generators.
+    pub fn to_owned(&self) -> BulletproofProof {
+        BulletproofProof {
+            generators: *self.generators,
+            proof: *self.proof,
+        }
+    }
+}
+
+// ===========================================================================
 // Inner-product argument (recursion-free, O(log n))
 // ===========================================================================
 
@@ -1527,5 +1708,92 @@ mod tests {
         // Manual: h_scalar = r*b*s_inv*1 = 5*2*s_inv
         let expected_hs = f_mul(f_mul(r, b), s_inv);
         assert_eq!(hs, expected_hs);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // BulletproofProof struct tests (issue #442)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// A valid proof wrapped in BulletproofProof verifies via `.verify()`.
+    #[test]
+    fn bulletproof_proof_verify_valid() {
+        let g = gens();
+        let proof = prove(&g, u256::from(42u8), u256::from(7u8), &[100u8; 64]).unwrap();
+        let bp = BulletproofProof::new(proof, g);
+        assert!(bp.verify());
+    }
+
+    /// A tampered proof wrapped in BulletproofProof fails verification.
+    #[test]
+    fn bulletproof_proof_verify_tampered() {
+        let g = gens();
+        let mut proof = prove(&g, u256::from(42u8), u256::from(7u8), &[101u8; 64]).unwrap();
+        proof.t_hat = f_add(proof.t_hat, u256::from(1u8));
+        let bp = BulletproofProof::new(proof, g);
+        assert!(!bp.verify());
+    }
+
+    /// Accessor methods return correct data from the wrapped proof.
+    #[test]
+    fn bulletproof_proof_accessors() {
+        let g = gens();
+        let proof = prove(&g, u256::from(99u8), u256::from(3u8), &[102u8; 64]).unwrap();
+        let bp = BulletproofProof::new(proof, g);
+
+        // Commitment matches.
+        assert_eq!(bp.commitment(), proof.v);
+
+        // L/R round vectors match.
+        assert_eq!(*bp.l_vec(), proof.ip_proof.l);
+        assert_eq!(*bp.r_vec(), proof.ip_proof.r);
+
+        // Final scalars match.
+        assert_eq!(bp.final_a(), proof.ip_proof.a);
+        assert_eq!(bp.final_b(), proof.ip_proof.b);
+
+        // Generator accessors return the same arrays.
+        assert_eq!(bp.g_generators()[0], g.g[0]);
+        assert_eq!(bp.h_generators()[0], g.h[0]);
+        assert_eq!(bp.blinding_generator(), g.h_blind);
+
+        // range_proof() and gens() return references to the inner data.
+        assert_eq!(*bp.range_proof(), proof);
+        assert_eq!(bp.gens().h_blind, g.h_blind);
+    }
+
+    /// BulletproofProofRef verifies without copying the generator arrays.
+    #[test]
+    fn bulletproof_proof_ref_verify() {
+        let g = gens();
+        let proof = prove(&g, u256::from(10u8), u256::from(5u8), &[103u8; 64]).unwrap();
+        let bp_ref = BulletproofProofRef::new(&proof, &g);
+        assert!(bp_ref.verify());
+    }
+
+    /// BulletproofProofRef accessors return correct data.
+    #[test]
+    fn bulletproof_proof_ref_accessors() {
+        let g = gens();
+        let proof = prove(&g, u256::from(77u8), u256::from(2u8), &[104u8; 64]).unwrap();
+        let bp_ref = BulletproofProofRef::new(&proof, &g);
+
+        assert_eq!(bp_ref.commitment(), proof.v);
+        let (a, b) = bp_ref.final_scalars();
+        assert_eq!(a, proof.ip_proof.a);
+        assert_eq!(b, proof.ip_proof.b);
+        assert_eq!(bp_ref.g_generators()[0], g.g[0]);
+        assert_eq!(bp_ref.blinding_generator(), g.h_blind);
+    }
+
+    /// Promoting a BulletproofProofRef to owned BulletproofProof preserves
+    /// verification.
+    #[test]
+    fn bulletproof_proof_ref_to_owned() {
+        let g = gens();
+        let proof = prove(&g, u256::from(55u8), u256::from(11u8), &[105u8; 64]).unwrap();
+        let bp_ref = BulletproofProofRef::new(&proof, &g);
+        let bp_owned = bp_ref.to_owned();
+        assert!(bp_owned.verify());
+        assert_eq!(bp_owned.commitment(), proof.v);
     }
 }

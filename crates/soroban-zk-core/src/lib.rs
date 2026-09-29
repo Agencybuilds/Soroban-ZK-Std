@@ -395,8 +395,7 @@ pub use polynomial::{DensePolynomial, SparsePolynomial};
 pub use ipa_generators::{
     commit_generators, ct_select_affine, fold_generators, fold_generators_rounds, GeneratorVec,
 };
-pub use halo2_ipa_batch::{batch_verify_ipa, verify_final_check, BatchIpaInput, BatchIpaIter, BatchIpaOutput};
-pub use plonk::{PlonkConfig, PlonkField, PlonkProof};
+pub use plonk::{PlonkConfig, PlonkField, PlonkProof, KzgEvalProofInputs, kzg_eval_proof_points};
 
 /// Errors returned by zero-knowledge conversion and validation operations.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
