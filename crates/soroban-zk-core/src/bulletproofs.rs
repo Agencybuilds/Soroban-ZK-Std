@@ -71,6 +71,7 @@ fn add_scaled(acc: G1Projective, pt: &G1Affine, s: u256) -> G1Projective {
 }
 
 /// `s1 * p1 + s2 * p2`.
+#[cfg(any(test, feature = "prover"))]
 #[inline(always)]
 fn lin_comb(p1: G1Affine, s1: u256, p2: G1Affine, s2: u256) -> G1Projective {
     G1Projective::from(p1.scalar_mul(s1)).add(&G1Projective::from(p2.scalar_mul(s2)))
@@ -78,7 +79,6 @@ fn lin_comb(p1: G1Affine, s1: u256, p2: G1Affine, s2: u256) -> G1Projective {
 
 /// Multi-scalar multiplication `sum_i scalars[i] * points[i]` (the core WASM
 /// primitive used everywhere). Constant memory footprint, fixed length.
-#[cfg(any(test, feature = "prover"))]
 fn msm(points: &[G1Affine], scalars: &[u256]) -> G1Projective {
     let mut acc = G1Projective::identity();
     for i in 0..points.len() {
@@ -391,38 +391,24 @@ fn ipa_fold(
     h0: [G1Affine; N],
     proof: &InnerProductProof,
 ) -> (G1Projective, G1Affine, G1Affine, u256, u256) {
-    let mut g = g0;
-    let mut h = h0;
     let mut p = G1Projective::from(p0);
+    let x_challenges = ipa_challenges(p0, proof);
+    let (g_scalars, h_scalars) = compute_ipa_scalars(&x_challenges);
+    let g_fold = msm(&g0, &g_scalars).to_affine();
+    let h_fold = msm(&h0, &h_scalars).to_affine();
 
-    let mut tr = Transcript::new();
-    tr.absorb_point(&p0);
-
-    let mut n = N;
-    let mut round = 0;
-    while n > 1 {
-        let half = n / 2;
+    for round in 0..IP_ROUNDS {
         let lp = proof.l[round];
         let rp = proof.r[round];
-        tr.absorb_point(&lp);
-        tr.absorb_point(&rp);
-        let x = tr.challenge();
+        let x = x_challenges[round];
         let x_inv = f_inv(x);
         let x2 = f_mul(x, x);
         let x2_inv = f_mul(x_inv, x_inv);
-
-        for i in 0..half {
-            g[i] = lin_comb(g[i], x_inv, g[half + i], x).to_affine();
-            h[i] = lin_comb(h[i], x, h[half + i], x_inv).to_affine();
-        }
         p = add_scaled(p, &lp, x2);
         p = add_scaled(p, &rp, x2_inv);
-
-        n = half;
-        round += 1;
     }
 
-    (p, g[0], h[0], proof.a, proof.b)
+    (p, g_fold, h_fold, proof.a, proof.b)
 }
 
 /// Verifies an inner-product argument.
@@ -812,16 +798,19 @@ fn compute_ipa_scalars(x_challenges: &[u256; IP_ROUNDS]) -> ([u256; N], [u256; N
         // When that bit is 1 the generator is in the upper half and picks up x_k;
         // when it is 0 the generator is in the lower half and picks up x_k^{-1}.
         let mut si = u256::from(1u8);
+        let mut si_inv = u256::from(1u8);
         for k in 0..IP_ROUNDS {
             let bit = (i >> (IP_ROUNDS - 1 - k)) & 1;
             if bit == 1 {
                 si = f_mul(si, x_challenges[k]);
+                si_inv = f_mul(si_inv, x_inv[k]);
             } else {
                 si = f_mul(si, x_inv[k]);
+                si_inv = f_mul(si_inv, x_challenges[k]);
             }
         }
         s[i] = si;
-        s_inv_arr[i] = f_inv(si);
+        s_inv_arr[i] = si_inv;
     }
 
     (s, s_inv_arr)
