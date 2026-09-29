@@ -7,6 +7,7 @@ pub mod groth16;
 pub mod host;
 pub mod pairing;
 pub mod poseidon2;
+pub mod telemetry;
 pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
@@ -185,7 +186,16 @@ impl ZkContract {
                     input.to_be_bytes().copy_into_slice(&mut buf);
                     inputs.push(eth_u256::from_be_bytes(buf));
                 }
-                groth16_verify(&env, &vk, &proof, &inputs)
+                let is_valid = groth16_verify(&env, &vk, &proof, &inputs)?;
+                if is_valid {
+                    let telemetry = crate::telemetry::VerificationTelemetry {
+                        proof_type: crate::telemetry::ProofType::Groth16,
+                        public_inputs_len: public_inputs.len() as u32,
+                        estimated_cost: 0, // Placeholder
+                    };
+                    crate::telemetry::emit_successful_verification(&env, telemetry);
+                }
+                Ok(is_valid)
             })();
 
             // Always clear the proof-context flag (the Temporary entry also
