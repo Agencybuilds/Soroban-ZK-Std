@@ -7,3 +7,5 @@
 pub mod poseidon;
 pub mod rescue_prime;
 pub mod sha256;
+
+pub use sha256::FieldByteAlign;

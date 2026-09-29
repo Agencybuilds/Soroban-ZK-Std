@@ -148,12 +148,40 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
 
 // ── Field-element wrappers ─────────────────────────────────────────────────────
 
+/// Byte-alignment boundary between ZK field elements and SHA-256 byte streams.
+///
+/// All conversions are strict 32-byte big-endian so circuit inputs map
+/// identically to on-chain hashes: two different field values can never
+/// collapse to the same bit stream.
+pub trait FieldByteAlign: Sized {
+    /// Canonical 32-byte big-endian encoding of a field element.
+    fn to_be_bytes(&self, env: &Env) -> [u8; 32];
+    /// Decode a canonical 32-byte big-endian buffer into a field element.
+    fn from_be_bytes(env: &Env, bytes: &[u8; 32]) -> Self;
+    /// Interpret a 32-byte SHA-256 digest as a field element.
+    /// Defaults to [`FieldByteAlign::from_be_bytes`] so implementors
+    /// do not duplicate logic.
+    fn digest_from_bytes(env: &Env, digest: &[u8; 32]) -> Self {
+        Self::from_be_bytes(env, digest)
+    }
+}
+
+impl FieldByteAlign for U256 {
+    fn to_be_bytes(&self, env: &Env) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        self.to_be_bytes().copy_into_slice(&mut b);
+        let _ = env;
+        b
+    }
+
+    fn from_be_bytes(env: &Env, bytes: &[u8; 32]) -> Self {
+        U256::from_be_bytes(env, &Bytes::from_array(env, bytes))
+    }
+}
+
 /// Convert a field element into its canonical 32-byte big-endian buffer.
 pub fn field_to_bytes(env: &Env, x: &U256) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    x.to_be_bytes().copy_into_slice(&mut b);
-    let _ = env;
-    b
+    <U256 as FieldByteAlign>::to_be_bytes(x, env)
 }
 
 /// SHA-256 of a single field element, returned as a digest field element.
@@ -189,7 +217,7 @@ pub fn assert_sha256_fields(env: &Env, fields: &[U256], claimed: &U256) -> Resul
 }
 
 fn digest_to_field(env: &Env, digest: &[u8; 32]) -> U256 {
-    U256::from_be_bytes(env, &Bytes::from_array(env, digest))
+    <U256 as FieldByteAlign>::digest_from_bytes(env, digest)
 }
 
 #[cfg(test)]
@@ -254,6 +282,30 @@ mod tests {
         assert_eq!(
             assert_sha256_fields(&env, &[a], &U256::from_u128(&env, 0)),
             Err(ZkError::ConstraintUnsatisfied)
+        );
+    }
+
+    #[test]
+    fn field_byte_align_preserves_leading_zeros() {
+        let env = env();
+        // Small values must keep all 31 leading zero bytes in big-endian
+        // order to match off-chain ZK circuit packing.
+        let x = U256::from_u128(&env, 1);
+        let b = <U256 as FieldByteAlign>::to_be_bytes(&x, &env);
+        assert_eq!(&b[..31], &[0u8; 31]);
+        assert_eq!(b[31], 1);
+        assert_eq!(field_to_bytes(&env, &x), b);
+        let y = <U256 as FieldByteAlign>::from_be_bytes(&env, &b);
+        assert_eq!(y, x);
+    }
+
+    #[test]
+    fn field_byte_align_digest_default_matches_from_be_bytes() {
+        let env = env();
+        let digest = sha256(b"abc");
+        assert_eq!(
+            <U256 as FieldByteAlign>::digest_from_bytes(&env, &digest),
+            <U256 as FieldByteAlign>::from_be_bytes(&env, &digest)
         );
     }
 
