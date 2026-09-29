@@ -103,6 +103,46 @@ impl<const T: usize, const F: usize> CustomGate<T, F> {
     }
 }
 
+/// Builds a fixed-capacity custom gate from vanishing-constraint monomials.
+///
+/// Each term is written as `coefficient => [(column, rotation), ...]`; factors
+/// are multiplied together and all terms are summed. The resulting gate
+/// evaluates to zero on every row when the constraint holds. This macro
+/// constructs the same allocation-free representation consumed by
+/// [`VerificationKey::evaluate_gates`].
+///
+/// The first two arguments set the maximum number of terms and factors per
+/// term. The macro returns `Result<CustomGate<...>, ZkError>` because a term
+/// can exceed the declared factor capacity or the gate can exceed its term
+/// capacity.
+///
+/// ```ignore
+/// let gate = custom_gate!(3, 2;
+///     coefficient_a => [(0, 0), (1, 0)],
+///     coefficient_b => [(2, 0)],
+///     coefficient_c => [],
+/// )?;
+/// ```
+#[macro_export]
+macro_rules! custom_gate {
+    ($max_terms:literal, $max_factors:literal; $(
+        $coefficient:expr => [$(($column:expr, $rotation:expr)),* $(,)?]
+    ),+ $(,)?) => {{
+        (|| -> Result<
+            $crate::halo2::CustomGate<{ $max_terms }, { $max_factors }>,
+            $crate::ZkError,
+        > {
+            let terms = [$(
+                $crate::halo2::GateTerm::<{ $max_factors }>::from_factors(
+                    $coefficient,
+                    &[$(($column, $rotation)),*],
+                )?,
+            )+];
+            $crate::halo2::CustomGate::<{ $max_terms }, { $max_factors }>::from_terms(&terms)
+        })()
+    }};
+}
+
 /// Halo2-style verification key, generic over the circuit dimensions.
 ///
 /// * `R` — number of rows (the evaluation domain size, a power of two).
@@ -684,10 +724,12 @@ mod tests {
     #[test]
     fn custom_gate_add_sub_constraint_holds() {
         // Gate: a + b - c = 0 over 3 columns.
-        let t0 = GateTerm::from_factors(u256::from(1u8), &[(0usize, 0i16)]).unwrap();
-        let t1 = GateTerm::from_factors(u256::from(1u8), &[(1usize, 0i16)]).unwrap();
-        let t2 = GateTerm::from_factors(neg_one(), &[(2usize, 0i16)]).unwrap();
-        let gate = CustomGate::from_terms(&[t0, t1, t2]).unwrap();
+        let gate = crate::custom_gate!(3, 1;
+            u256::from(1u8) => [(0usize, 0i16)],
+            u256::from(1u8) => [(1usize, 0i16)],
+            neg_one() => [(2usize, 0i16)],
+        )
+        .unwrap();
 
         let vk = VerificationKey::<2, 3, 6, 1, 3, 1> {
             domain_size: 2,
