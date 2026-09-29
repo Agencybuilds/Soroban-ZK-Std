@@ -725,6 +725,27 @@ pub fn verify(gens: &Generators, proof: &RangeProof) -> bool {
     compute_residual(gens, proof).is_identity()
 }
 
+/// Verify only the inner‑product argument part of a range proof.
+/// Returns `true` iff the inner‑product proof is valid for the given
+/// generators and proof data.
+pub fn verify_inner_product(gens: &Generators, proof: &RangeProof) -> bool {
+    // Derive the Fiat‑Shamir challenges used in the proof.
+    let (y, z, x) = derive_challenges(proof);
+    // Reconstruct the commitment point P from the public components.
+    let p = compute_p(gens, &proof.a, &proof.s, y, z, x, proof.t_hat, proof.mu);
+    // Apply the y‑weighting to the h generators.
+    let h_tilde = compute_h_tilde(&gens.h, y);
+    // Fold the inner‑product proof to obtain the final relation.
+    let (pf, gf, hf, a, b) = ipa_fold(p, gens.g, h_tilde, &proof.ip_proof);
+    // Re‑create the target point a*gf + b*hf + (a*b)*H_blind.
+    let mut target = G1Projective::from(gf.scalar_mul(a));
+    target = add_scaled(target, &hf, b);
+    target = add_scaled(target, &gens.h_blind, f_mul(a, b));
+    // The proof is valid iff the folded point equals the target.
+    let diff = pf.add(&neg_proj(target));
+    diff.is_identity()
+}
+
 /// Verify a batch of range proofs via random linear combination.
 ///
 /// All per-proof residual equations are collapsed into a single multi-scalar
