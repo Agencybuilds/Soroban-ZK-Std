@@ -237,6 +237,13 @@ impl<const R: usize, const C: usize, const N: usize, const G: usize, const T: us
         }
         self.verify_permutation(&values, beta, gamma)
     }
+
+    /// Evaluate the vanishing polynomial `t(X) = X^n - 1` for a domain of size `n`
+    /// at the given evaluation point `x`.
+    pub fn evaluate_vanishing_polynomial(&self, x: u256) -> u256 {
+        let x_n = Bn254::pow(x, u256::from(self.domain_size as u64));
+        Bn254::sub(x_n, u256::from(1u8))
+    }
 }
 
 /// Maps a (row, rotation) pair to a concrete row index with modular wrap-around.
