@@ -36,11 +36,11 @@ use crate::pairing::{g1_to_bytes, G2Affine};
 /// Lower TTL bound (in ledgers) for the instance entry. When the remaining
 /// time-to-live drops below this threshold, the entry is extended back up to
 /// [`INSTANCE_BUMP_AMOUNT`]. ~1 day at 5s ledger close time.
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280;
+pub(crate) const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280;
 
 /// Target TTL (in ledgers) the instance entry is extended to on access.
 /// ~30 days at 5s ledger close time.
-const INSTANCE_BUMP_AMOUNT: u32 = 518_400;
+pub(crate) const INSTANCE_BUMP_AMOUNT: u32 = 518_400;
 
 /// Keys for the recurring cryptographic constants cached in instance storage.
 #[contracttype]
@@ -56,6 +56,10 @@ pub enum ConstantKey {
     G1Generator,
     /// Canonical BN254 G2 generator point.
     G2Generator,
+    /// Rescue-Prime (t=3) MDS matrix (3x3).
+    RescuePrimeMds,
+    /// Rescue-Prime (t=3) round keys (6 rounds x 3 elements).
+    RescuePrimeRoundKeys,
 }
 
 /// Bump the instance TTL so the cached constants stay live during active use.
@@ -155,6 +159,30 @@ pub fn g2_generator(env: &Env) -> G2Affine {
     };
     bump(env);
     value
+}
+
+/// Return the cached Rescue-Prime parameters (MDS matrix + round keys),
+/// computing and storing them on the first call within the contract.
+pub fn rescue_prime_params(env: &Env) -> crate::gadgets::hash::rescue_prime::RescueParams {
+    let store = env.storage().instance();
+    let mds = match store.get::<ConstantKey, soroban_sdk::Vec<soroban_sdk::Vec<soroban_sdk::U256>>>(&ConstantKey::RescuePrimeMds) {
+        Some(m) => m,
+        None => {
+            let m = crate::gadgets::hash::rescue_prime::build_mds_for_cache(env);
+            store.set(&ConstantKey::RescuePrimeMds, &m);
+            m
+        }
+    };
+    let round_keys = match store.get::<ConstantKey, soroban_sdk::Vec<soroban_sdk::Vec<soroban_sdk::U256>>>(&ConstantKey::RescuePrimeRoundKeys) {
+        Some(rk) => rk,
+        None => {
+            let rk = crate::gadgets::hash::rescue_prime::build_round_keys_for_cache(env);
+            store.set(&ConstantKey::RescuePrimeRoundKeys, &rk);
+            rk
+        }
+    };
+    bump(env);
+    crate::gadgets::hash::rescue_prime::RescueParams::from_cached(env, mds, round_keys)
 }
 
 #[cfg(test)]
