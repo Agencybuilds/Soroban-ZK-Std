@@ -69,30 +69,69 @@ impl RescueParams {
 
 /// Rescue-Prime sponge hash over BN254 Fr.
 ///
-/// Absorbs `message` (field elements) in blocks of `rate = STATE - 1`, then
-/// squeezes a single field element as the digest. Capacity is 1 (state[0]).
+/// Absorbs `message` (field elements) in blocks of `rate = STATE - 1` with
+/// pad10* (`1` followed by `0`s), then squeezes a single field element.
+/// Capacity is 1 (state[0], never directly absorbed). An exact-multiple
+/// input (including empty) gets a full extra padding block `[1, 0]`, so
+/// `[]`, `[0]`, and `[0, 0]` all digest distinctly.
 pub fn rescue_prime_hash(env: &Env, message: &[U256]) -> U256 {
+    let mut fields = alloc::vec::Vec::with_capacity(message.len());
+    for m in message.iter() {
+        fields.push(to_eth_v(m));
+    }
+    from_eth_v(env, hash_eth_padded(&fields))
+}
+
+/// Rescue-Prime hash over a variable-length byte string.
+///
+/// Chunks `bytes` into 32-byte big-endian blocks (last block zero-padded on
+/// the right, matching the transcript chunking convention), interprets each
+/// block as a field element (reduced mod `Fr` on absorb), then applies the
+/// same pad10* sponge as [`rescue_prime_hash`].
+pub fn rescue_prime_hash_bytes(env: &Env, bytes: &Bytes) -> U256 {
+    let n = bytes.len() as usize;
+    let num_blocks = (n + 31) / 32;
+    let mut fields = alloc::vec::Vec::with_capacity(num_blocks);
+    for b in 0..num_blocks {
+        let mut buf = [0u8; 32];
+        for k in 0..32 {
+            let idx = b * 32 + k;
+            buf[k] = if idx < n {
+                bytes.get(idx as u32).unwrap_or(0)
+            } else {
+                0
+            };
+        }
+        fields.push(eth_u256::from_be_bytes(buf));
+    }
+    from_eth_v(env, hash_eth_padded(&fields))
+}
+
+/// Shared pad10* sponge core over native field elements.
+fn hash_eth_padded(elems: &[eth_u256]) -> eth_u256 {
     let params = RescueParams::new();
     let rate = STATE - 1;
     let mut state = [eth_u256::ZERO; STATE];
 
     let mut idx = 0;
-    while idx < message.len() {
-        // Absorb one block into the rate portion (capacity untouched).
+    while idx + rate <= elems.len() {
         for k in 0..rate {
-            if idx + k < message.len() {
-                state[k + 1] = fadd(state[k + 1], to_eth_v(&message[idx + k]));
-            }
+            state[k + 1] = fadd(state[k + 1], elems[idx + k]);
         }
         params.permute(&mut state);
         idx += rate;
     }
-    // Final permutation if the message was empty ensures a non-trivial digest.
-    if message.is_empty() {
-        params.permute(&mut state);
+    // Remainder is 0 or 1 (rate == 2): append `1`, zero-fill the rest.
+    let rem = elems.len() - idx;
+    if rem == 1 {
+        state[1] = fadd(state[1], elems[idx]);
+        state[2] = fadd(state[2], eth_u256::ONE);
+    } else {
+        state[1] = fadd(state[1], eth_u256::ONE);
     }
+    params.permute(&mut state);
 
-    from_eth_v(env, state[1])
+    state[1]
 }
 
 #[inline(always)]
@@ -288,6 +327,65 @@ mod tests {
         assert_eq!(h, rescue_prime_hash(&env, &[]));
         let bytes = h.to_be_bytes();
         let _ = bytes;
+    }
+
+    #[test]
+    fn padding_separates_empty_zero_and_two_zeros() {
+        let env = env();
+        let h_empty = rescue_prime_hash(&env, &[]);
+        let h_one = rescue_prime_hash(&env, &[U256::from_u128(&env, 0)]);
+        let h_two = rescue_prime_hash(
+            &env,
+            &[U256::from_u128(&env, 0), U256::from_u128(&env, 0)],
+        );
+        assert_ne!(h_empty, h_one);
+        assert_ne!(h_empty, h_two);
+        assert_ne!(h_one, h_two);
+    }
+
+    #[test]
+    fn exact_multiple_gets_full_padding_block() {
+        let env = env();
+        let a = U256::from_u128(&env, 1);
+        let b = U256::from_u128(&env, 2);
+        let c = U256::from_u128(&env, 3);
+        let h_two = rescue_prime_hash(&env, &[a.clone(), b.clone()]);
+        assert_eq!(h_two, rescue_prime_hash(&env, &[a, b]));
+        // Different lengths must not collide through padding.
+        assert_ne!(
+            h_two,
+            rescue_prime_hash(&env, &[U256::from_u128(&env, 1)])
+        );
+        assert_ne!(
+            h_two,
+            rescue_prime_hash(
+                &env,
+                &[
+                    U256::from_u128(&env, 1),
+                    U256::from_u128(&env, 2),
+                    c
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn hash_bytes_matches_chunked_fields() {
+        use soroban_sdk::Bytes;
+        let env = env();
+        let raw = [1u8, 2u8, 3u8];
+        let bytes = Bytes::from_slice(&env, &raw);
+        let mut block = [0u8; 32];
+        block[..3].copy_from_slice(&raw);
+        let field = U256::from_be_bytes(&env, &Bytes::from_array(&env, &block));
+        assert_eq!(
+            rescue_prime_hash_bytes(&env, &bytes),
+            rescue_prime_hash(&env, &[field])
+        );
+        assert_eq!(
+            rescue_prime_hash_bytes(&env, &Bytes::from_slice(&env, &[])),
+            rescue_prime_hash(&env, &[])
+        );
     }
 
     #[test]
