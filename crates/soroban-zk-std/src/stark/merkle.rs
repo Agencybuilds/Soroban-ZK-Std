@@ -21,6 +21,7 @@
 use soroban_sdk::{Bytes, BytesN, Env, Vec};
 
 use crate::stark::field::Felt;
+use alloc::vec::Vec as AllocVec;
 
 /// Maximum tree depth supported by a [`MerklePath`] (covers `2^32` leaves).
 pub const MAX_DEPTH: u32 = 32;
@@ -80,6 +81,77 @@ impl MerklePath {
     pub fn verify(&self, env: &Env, leaf: &BytesN<32>, root: &BytesN<32>) -> bool {
         &self.compute_root(env, leaf) == root
     }
+}
+
+/// Batch verify multiple Merkle paths to avoid re-hashing shared intermediate nodes.
+/// Re-uses intermediate nodes where paths intersect.
+pub fn verify_batch(
+    env: &Env,
+    leaves: &Vec<BytesN<32>>,
+    paths: &Vec<MerklePath>,
+    root: &BytesN<32>,
+) -> bool {
+    if leaves.len() != paths.len() {
+        return false;
+    }
+    if leaves.len() == 0 {
+        return true;
+    }
+
+    let depth = paths.get(0).unwrap().depth;
+
+    let mut current_level: AllocVec<(u64, [u8; 32], u32)> = AllocVec::new();
+    for i in 0..leaves.len() {
+        let p = paths.get(i).unwrap();
+        if p.depth != depth {
+            return false; // All paths must have the same depth
+        }
+        current_level.push((p.index, leaves.get(i).unwrap().to_array(), i));
+    }
+
+    // Sort by index to group siblings together
+    current_level.sort_unstable_by_key(|k| k.0);
+
+    // Ensure no duplicate indices
+    for i in 1..current_level.len() {
+        if current_level[i - 1].0 == current_level[i].0 {
+            return false;
+        }
+    }
+
+    for d in 0..depth {
+        let mut next_level: AllocVec<(u64, [u8; 32], u32)> = AllocVec::with_capacity(current_level.len());
+        let mut i = 0;
+        while i < current_level.len() {
+            let (idx, hash, path_id) = current_level[i];
+            let parent_idx = idx >> 1;
+
+            if i + 1 < current_level.len() && current_level[i + 1].0 == (idx ^ 1) {
+                // Sibling is present in the batch
+                let sibling_hash = current_level[i + 1].1;
+                let (l, r) = if idx & 1 == 0 { (hash, sibling_hash) } else { (sibling_hash, hash) };
+                let parent_hash = sha_pair(&l, &r, env);
+                next_level.push((parent_idx, parent_hash, path_id));
+                i += 2;
+            } else {
+                // Sibling not in batch, use the one from the path
+                let p = paths.get(path_id).unwrap();
+                let sibling_hash = p.siblings[d as usize];
+                let (l, r) = if idx & 1 == 0 { (hash, sibling_hash) } else { (sibling_hash, hash) };
+                let parent_hash = sha_pair(&l, &r, env);
+                next_level.push((parent_idx, parent_hash, path_id));
+                i += 1;
+            }
+        }
+        current_level = next_level;
+    }
+
+    if current_level.len() != 1 {
+        return false;
+    }
+
+    let final_hash = current_level[0].1;
+    &BytesN::from_array(env, &final_hash) == root
 }
 
 /// Build the Merkle root over a list of leaf digests (prover-side helper / test
@@ -178,6 +250,36 @@ mod tests {
         let leaf = felt_leaf(&env, Felt::new(0));
         let wrong = BytesN::from_array(&env, &[0xab; 32]);
         assert!(!path.verify(&env, &leaf, &wrong));
+    }
+
+    #[test]
+    fn batch_verifies_valid_paths() {
+        let env = env();
+        let mut leaves = Vec::new(&env);
+        for i in 0..8u64 {
+            leaves.push_back(felt_leaf(&env, Felt::new(i)));
+        }
+        let root = merkle_root(&env, &leaves);
+
+        let idx0 = 2u32;
+        let idx1 = 3u32; // sibling to idx0
+        let idx2 = 5u32;
+        
+        let path0 = open(&env, &leaves, idx0);
+        let path1 = open(&env, &leaves, idx1);
+        let path2 = open(&env, &leaves, idx2);
+        
+        let mut batch_leaves = Vec::new(&env);
+        batch_leaves.push_back(felt_leaf(&env, Felt::new(idx0 as u64)));
+        batch_leaves.push_back(felt_leaf(&env, Felt::new(idx1 as u64)));
+        batch_leaves.push_back(felt_leaf(&env, Felt::new(idx2 as u64)));
+        
+        let mut batch_paths = Vec::new(&env);
+        batch_paths.push_back(path0);
+        batch_paths.push_back(path1);
+        batch_paths.push_back(path2);
+        
+        assert!(verify_batch(&env, &batch_leaves, &batch_paths, &root), "batch verify should succeed");
     }
 }
 
