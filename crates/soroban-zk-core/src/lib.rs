@@ -7,6 +7,12 @@ pub mod bulletproofs;
 pub mod hash;
 pub mod poseidon2;
 pub mod rescue;
+/// Bit-packing and unpacking utilities for SHA-256 word conversion (Issue #457).
+///
+/// Provides `pack_bytes_to_words`, `unpack_words_to_bytes`, `field_to_words`,
+/// `words_to_field`, and related helpers for converting BN254 field elements
+/// into contiguous `[u32; 8]` blocks ready for SHA-256 hashing.
+pub mod sha256_words;
 
 pub mod elgamal {
     use super::*;
