@@ -393,6 +393,7 @@ pub mod elgamal {
 pub use elgamal::ElGamalCiphertext;
 pub mod halo2;
 pub mod halo2_ipa;
+pub mod halo2_ipa_batch;
 pub mod ipa_generators;
 pub mod plonk;
 pub mod polynomial;
@@ -400,7 +401,7 @@ pub use polynomial::{DensePolynomial, SparsePolynomial};
 pub use ipa_generators::{
     commit_generators, ct_select_affine, fold_generators, fold_generators_rounds, GeneratorVec,
 };
-pub use plonk::{PlonkConfig, PlonkField, PlonkProof};
+pub use plonk::{PlonkConfig, PlonkField, PlonkProof, KzgEvalProofInputs, kzg_eval_proof_points};
 
 /// Errors returned by zero-knowledge conversion and validation operations.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

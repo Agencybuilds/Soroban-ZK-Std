@@ -2,12 +2,14 @@
 extern crate alloc;
 
 pub mod cache;
+pub mod events;
 pub mod gadgets;
 pub mod groth16;
 pub mod halo2;
 pub mod host;
 pub mod nullifier;
 pub mod pairing;
+pub mod plonk_kzg;
 pub mod poseidon2;
 pub mod rescue_prime;
 pub mod vk;
@@ -15,10 +17,15 @@ pub mod vk;
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 pub use halo2::{Halo2StorageKey, LookupTable, PermutationKey};
 pub use pairing::{pairing_check, G2Affine};
+pub use plonk_kzg::verify_plonk_kzg;
 pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
     vk_to_bytes, G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey, VerificationContext, VkMeta,
     VkStorageKey, VK_CHUNK_SIZE,
+};
+pub use events::{
+    ZkVerificationEvent, ZkVerificationFailure, ZkVerificationStage, ZkFailureContext,
+    publish_verification_event, publish_legacy_event,
 };
 
 pub use rescue_prime::{
@@ -202,98 +209,188 @@ impl ZkContract {
     }
 
     /// Loads the stored verification key, verifies a Groth16 proof against it,
-    /// and clears the short-lived proof-context flag afterwards.
+    /// Verifies a zero-knowledge proof with comprehensive structured event emission.
     ///
-    /// ## State-rollback safety (Issue #466)
-    /// A [`VerificationContext`] RAII guard is created immediately after the VK
-    /// is loaded.  The guard writes the proof-context marker to
-    /// `StorageType::Temporary` and **unconditionally** removes it when dropped
-    /// — even if deserialization fails, an invalid field element is detected,
-    /// or the pairing check returns an error.  This prevents partially-written
-    /// state from surviving a mid-verification failure.
-    ///
-    /// Deserialized public inputs are held in a
-    /// [`soroban_zk_core::zeroize::sensitive_vec::SensitiveVec`] so that the
-    /// raw scalar bytes are zero-filled via `write_volatile` before their
-    /// heap allocation is released.
+    /// This method emits detailed [`ZkVerificationEvent`] events that developers can
+    /// use to understand exactly what happened during verification, including:
+    /// - Success/failure status
+    /// - The specific constraint or validation that failed
+    /// - The stage of verification where the failure occurred
+    /// - Additional context for debugging
     ///
     /// When `anti_replay` is `true` the verifier additionally records a
     /// SHA-256 commitment over `proof_bytes || public_inputs` in
     /// `StorageType::Persistent`.  Any attempt to re-submit the same proof
     /// will return [`ZkContractError::ReplayDetected`] **before** running the
     /// pairing check, eliminating the gas cost of a redundant verification.
+    ///
+    /// # Event Topics
+    /// Events are published with topics: `("zk_verification", "groth16", success_bool)`
+    ///
+    /// # Verification Stages (with event emission)
+    /// 1. Anti-replay check - detects previously verified proofs
+    /// 2. Verifying key load - loads VK from storage
+    /// 3. Proof deserialization - decodes proof bytes into curve points
+    /// 4. Public inputs validation - checks field element bounds
+    /// 5. Pairing check - the cryptographic verification
+    /// 6. Nullifier recording - prevents replay attacks
     pub fn verify_proof(
         env: Env,
         proof_bytes: Bytes,
         public_inputs: Vec<U256>,
         anti_replay: bool,
     ) -> Result<bool, ZkContractError> {
-        // ── Anti-replay check (fast-path: reject before the expensive pairing) ──
-        //
-        // We check *before* proof verification so a replayed proof never burns
-        // the gas budget for a pairing check.  The nullifier is committed to
-        // the full `proof_bytes || serialised_inputs` tuple, so the same proof
-        // with different public inputs remains a valid new submission.
+        use crate::events::{
+            ZkVerificationEvent, ZkVerificationStage, ZkFailureContext, 
+            publish_verification_event
+        };
+
+        let proof_length = proof_bytes.len();
+        let public_inputs_count = public_inputs.len() as u32;
+        let proof_system = "groth16";
+
+        // ── Anti-replay check (fast-path: reject before expensive pairing) ──
         if anti_replay {
             let inputs_buf = nullifier::inputs_to_bytes(&env, &public_inputs);
             let nstore = nullifier::NullifierStore::new(&env);
-            // If spent → early return, no state change.
+            
             if nstore.is_spent(&env, &proof_bytes, &inputs_buf) {
-                return Err(ZkContractError::ReplayDetected);
+                let error = ZkContractError::ReplayDetected;
+                let event = ZkVerificationEvent::failure(
+                    &env,
+                    proof_system,
+                    public_inputs_count,
+                    proof_length,
+                    anti_replay,
+                    &error,
+                    ZkVerificationStage::AntiReplayCheck,
+                    Some(ZkFailureContext::with_info(&env, "Proof already verified")),
+                );
+                publish_verification_event(&env, event);
+                return Err(error);
             }
         }
 
         let result: Result<bool, ZkError> = (|| {
-            let owned = vk::load_vk(&env)?;
+            let owned = vk::load_vk(&env).map_err(|e| {
+                let event = ZkVerificationEvent::failure(
+                    &env,
+                    proof_system,
+                    public_inputs_count,
+                    proof_length,
+                    anti_replay,
+                    &ZkContractError::from(e),
+                    ZkVerificationStage::VerifyingKeyLoad,
+                    Some(ZkFailureContext::with_info(&env, "VK not found in storage")),
+                );
+                publish_verification_event(&env, event);
+                e
+            })?;
+
             let vk = owned.as_vk();
+            vk::set_proof_context(&env, &proof_bytes);
 
-            // ── State-rollback safety boundary (Issue #466) ──────────────────
-            // The RAII guard writes the proof-context marker and guarantees it
-            // is cleared when this closure exits — success, error, or `?`.
-            // Bind with a named variable (not `_`) so it lives until the end
-            // of the closure scope.
-            let _ctx = vk::VerificationContext::begin(&env, &proof_bytes);
+            let outcome = (|| {
+                let proof_buf: alloc::vec::Vec<u8> = proof_bytes.iter().collect();
+                let proof = Groth16Proof::from_bytes(&proof_buf).map_err(|e| {
+                    let event = ZkVerificationEvent::failure(
+                        &env,
+                        proof_system,
+                        public_inputs_count,
+                        proof_length,
+                        anti_replay,
+                        &ZkContractError::from(e),
+                        ZkVerificationStage::ProofDeserialization,
+                        Some(ZkFailureContext::with_info(&env, "Invalid proof encoding or curve points")),
+                    );
+                    publish_verification_event(&env, event);
+                    e
+                })?;
 
-            // Deserialise the proof.
-            let proof_buf: alloc::vec::Vec<u8> = proof_bytes.iter().collect();
-            let proof = Groth16Proof::from_bytes(&proof_buf)?;
+                let mut inputs: alloc::vec::Vec<eth_u256> =
+                    alloc::vec::Vec::with_capacity(public_inputs.len() as usize);
+                
+                for (index, input) in public_inputs.iter().enumerate() {
+                    let mut buf = [0u8; 32];
+                    input.to_be_bytes().copy_into_slice(&mut buf);
+                    let eth_input = eth_u256::from_be_bytes(buf);
+                    
+                    if !Bn254::is_valid_scalar(eth_input) {
+                        let event = ZkVerificationEvent::failure(
+                            &env,
+                            proof_system,
+                            public_inputs_count,
+                            proof_length,
+                            anti_replay,
+                            &ZkContractError::InvalidFieldElement,
+                            ZkVerificationStage::PublicInputsValidation,
+                            Some(ZkFailureContext::invalid_input(index as u32)),
+                        );
+                        publish_verification_event(&env, event);
+                        return Err(ZkError::InvalidFieldElement);
+                    }
+                    inputs.push(eth_input);
+                }
 
-            // Deserialise the public inputs into a SensitiveVec so the scalar
-            // bytes are zero-filled (via write_volatile) when the vector is
-            // dropped — regardless of whether verification succeeds or fails.
-            let mut raw_inputs: alloc::vec::Vec<eth_u256> =
-                alloc::vec::Vec::with_capacity(public_inputs.len() as usize);
-            for input in public_inputs.iter() {
-                let mut buf = [0u8; 32];
-                input.to_be_bytes().copy_into_slice(&mut buf);
-                raw_inputs.push(eth_u256::from_be_bytes(buf));
-            }
-            let sensitive_inputs =
-                soroban_zk_core::zeroize::sensitive_vec::SensitiveVec::new(raw_inputs);
+                groth16_verify(&env, &vk, &proof, &inputs)
+            })();
 
-            // Run the pairing-based verifier.
-            // `sensitive_inputs` is dropped (and zeroed) at end of scope.
-            // `_ctx` is dropped at end of scope → clear_proof_context runs.
-            groth16_verify(&env, &vk, &proof, sensitive_inputs.as_slice())
+            vk::clear_proof_context(&env);
+            outcome
         })();
 
-        // ── Record nullifier only after a successful verification ──────────────
-        //
-        // We write the nullifier *after* verification so that a proof that
-        // fails on-chain (bad pairing, invalid inputs, …) is not burned in the
-        // nullifier set — the submitter would lose the ability to re-submit a
-        // corrected proof if we wrote before.  Only an accepted proof (one that
-        // returns `Ok(true)`) is recorded as spent.
-        if anti_replay {
-            if let Ok(true) = result {
-                let inputs_buf = nullifier::inputs_to_bytes(&env, &public_inputs);
-                let nstore = nullifier::NullifierStore::new(&env);
-                nstore.mark_spent(&env, &proof_bytes, &inputs_buf)
-                    .map_err(|_| ZkContractError::StorageError)?;
+        // ── Handle verification result and emit appropriate events ──
+        match result {
+            Ok(true) => {
+                // Successful verification - record nullifier if enabled
+                if anti_replay {
+                    let inputs_buf = nullifier::inputs_to_bytes(&env, &public_inputs);
+                    let nstore = nullifier::NullifierStore::new(&env);
+                    
+                    if let Err(_) = nstore.mark_spent(&env, &proof_bytes, &inputs_buf) {
+                        let event = ZkVerificationEvent::failure(
+                            &env,
+                            proof_system,
+                            public_inputs_count,
+                            proof_length,
+                            anti_replay,
+                            &ZkContractError::StorageError,
+                            ZkVerificationStage::NullifierRecording,
+                            Some(ZkFailureContext::with_info(&env, "Storage write failed")),
+                        );
+                        publish_verification_event(&env, event);
+                        return Err(ZkContractError::StorageError);
+                    }
+                }
+
+                // Emit success event
+                let event = ZkVerificationEvent::success(
+                    &env,
+                    proof_system,
+                    public_inputs_count,
+                    proof_length,
+                    anti_replay,
+                );
+                publish_verification_event(&env, event);
+                Ok(true)
+            }
+            Ok(false) => {
+                // Pairing check returned false - proof is mathematically invalid
+                let event = ZkVerificationEvent::pairing_failure(
+                    &env,
+                    proof_system,
+                    public_inputs_count,
+                    proof_length,
+                    anti_replay,
+                );
+                publish_verification_event(&env, event);
+                Ok(false)
+            }
+            Err(e) => {
+                // Error already handled and event emitted in the verification chain
+                Err(ZkContractError::from(e))
             }
         }
-
-        result.map_err(ZkContractError::from)
     }
 }
 
