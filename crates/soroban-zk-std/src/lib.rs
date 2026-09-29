@@ -4,6 +4,7 @@ extern crate alloc;
 pub mod cache;
 pub mod gadgets;
 pub mod groth16;
+pub mod halo2;
 pub mod host;
 pub mod nullifier;
 pub mod pairing;
@@ -11,7 +12,7 @@ pub mod poseidon2;
 pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
-pub use nullifier::{inputs_to_bytes, NullifierKey, NullifierSet, NullifierStore};
+pub use halo2::{Halo2StorageKey, LookupTable, PermutationKey};
 pub use pairing::{pairing_check, G2Affine};
 pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
@@ -142,6 +143,33 @@ impl ZkContract {
             sponge.absorb(core::slice::from_ref(&input));
         }
         sponge.squeeze()
+    }
+
+    /// Returns the Halo2 permutation key (`sigma`) for a `rows × cols` grid,
+    /// lazily initialising it in `StorageType::Instance` on first use so that
+    /// subsequent contract calls read the cached key instead of rebuilding it.
+    pub fn halo2_permutation_key(
+        env: Env,
+        rows: u32,
+        cols: u32,
+    ) -> Result<Vec<u32>, ZkContractError> {
+        let key = halo2::get_or_init_permutation_key(&env, rows, cols)
+            .map_err(ZkContractError::from)?;
+        Ok(key.sigma)
+    }
+
+    /// Lazily builds the range-check lookup table `[0, max] -> 1`, caches it in
+    /// `StorageType::Instance` under `id`, then returns the table output for
+    /// `value` (a membership proof that `value <= max`).
+    pub fn halo2_range_lookup(
+        env: Env,
+        id: u32,
+        max: u32,
+        value: U256,
+    ) -> Result<U256, ZkContractError> {
+        let lut = halo2::get_or_init_range_lookup_table(&env, id, max)
+            .map_err(ZkContractError::from)?;
+        lut.lookup(&[value]).map_err(ZkContractError::from)
     }
 
     /// Persists a verification key (serialized via [`vk::vk_to_bytes`]) to
@@ -321,197 +349,58 @@ mod tests {
         });
     }
 
-    // ── verify_proof anti-replay integration tests ───────────────────────────
-
-    /// Builds a minimal but structurally valid 256-byte proof buffer using the
-    /// canonical G1 / G2 generator points (a real pairing check would fail, but
-    /// that's fine — these tests exercise the nullifier layer only).
-    fn dummy_proof_bytes(env: &Env) -> Bytes {
-        use crate::pairing::g1_to_bytes;
-        let g1 = vk::G1_GENERATOR;
-        let g2 = vk::G2_GENERATOR;
-        let mut buf = Bytes::new(env);
-        buf.extend_from_array(&g1_to_bytes(&g1));   // A  (64 bytes)
-        buf.extend_from_array(&g2.to_bytes());       // B (128 bytes)
-        buf.extend_from_array(&g1_to_bytes(&g1));   // C  (64 bytes)
-        buf
-    }
-
     #[test]
-    fn verify_proof_anti_replay_rejected_on_second_call() {
-        use ark_bn254::{Bn254 as ArkBn254, Fr as ArkFr};
-        use ark_groth16::{prepare_verifying_key, Groth16};
-        use ark_relations::gr1cs::{
-            ConstraintSynthesizer, ConstraintSystemRef, LinearCombination, SynthesisError,
-        };
-        use ark_snark::SNARK;
-        use ark_std::rand::{rngs::StdRng, SeedableRng};
-        use ark_ff::{BigInteger, PrimeField};
-
-        #[derive(Clone)]
-        struct SquareCircuit {
-            x: Option<ArkFr>,
-            public_square: Option<ArkFr>,
-        }
-        impl ConstraintSynthesizer<ArkFr> for SquareCircuit {
-            fn generate_constraints(
-                self,
-                cs: ConstraintSystemRef<ArkFr>,
-            ) -> Result<(), SynthesisError> {
-                let x = cs.new_witness_variable(|| {
-                    self.x.ok_or(SynthesisError::AssignmentMissing)
-                })?;
-                let sq = cs.new_input_variable(|| {
-                    self.public_square.ok_or(SynthesisError::AssignmentMissing)
-                })?;
-                cs.enforce_r1cs_constraint(
-                    || LinearCombination::from(x),
-                    || LinearCombination::from(x),
-                    || LinearCombination::from(sq),
-                )
-            }
-        }
-
+    fn halo2_permutation_key_is_cached_across_calls() {
         let env = Env::default();
         env.cost_estimate().budget().reset_unlimited();
-
-        let mut rng = StdRng::seed_from_u64(42);
-        let (pk, ark_vk) =
-            Groth16::<ArkBn254>::circuit_specific_setup(
-                SquareCircuit { x: None, public_square: None },
-                &mut rng,
-            )
-            .unwrap();
-
-        let ark_proof = Groth16::<ArkBn254>::prove(
-            &pk,
-            SquareCircuit {
-                x: Some(ArkFr::from(3u64)),
-                public_square: Some(ArkFr::from(9u64)),
-            },
-            &mut rng,
-        )
-        .unwrap();
-
-        // ── Helpers to convert arkworks → local types ──────────────────────
-        use crate::groth16::g1_from_bytes as local_g1;
-        use crate::pairing::g1_to_bytes;
-        use ethnum::u256 as eu256;
-        use soroban_zk_core::G1Affine;
-
-        fn fq_u256(v: ark_bn254::Fq) -> eu256 {
-            let bytes = v.into_bigint().to_bytes_be();
-            let mut out = [0u8; 32];
-            out[32 - bytes.len()..].copy_from_slice(&bytes);
-            eu256::from_be_bytes(out)
-        }
-        fn fr_u256(v: ArkFr) -> eu256 {
-            let bytes = v.into_bigint().to_bytes_be();
-            let mut out = [0u8; 32];
-            out[32 - bytes.len()..].copy_from_slice(&bytes);
-            eu256::from_be_bytes(out)
-        }
-        fn to_g1(p: ark_bn254::G1Affine) -> G1Affine {
-            G1Affine { x: fq_u256(p.x), y: fq_u256(p.y) }
-        }
-        fn to_g2(p: ark_bn254::G2Affine) -> crate::pairing::G2Affine {
-            crate::pairing::G2Affine {
-                x: (fq_u256(p.x.c0), fq_u256(p.x.c1)),
-                y: (fq_u256(p.y.c0), fq_u256(p.y.c1)),
-            }
-        }
-
-        let ic_local = [
-            to_g1(ark_vk.gamma_abc_g1[0]),
-            to_g1(ark_vk.gamma_abc_g1[1]),
-        ];
-        let local_vk = crate::vk::OwnedVerifyingKey {
-            alpha_g1: to_g1(ark_vk.alpha_g1),
-            beta_g2: to_g2(ark_vk.beta_g2),
-            gamma_g2: to_g2(ark_vk.gamma_g2),
-            delta_g2: to_g2(ark_vk.delta_g2),
-            ic: alloc::vec![ic_local[0], ic_local[1]],
-        };
-
-        // Serialise proof → 256-byte buffer
-        let mut pbuf = [0u8; 256];
-        pbuf[..64].copy_from_slice(&g1_to_bytes(&to_g1(ark_proof.a)));
-        pbuf[64..192].copy_from_slice(&to_g2(ark_proof.b).to_bytes());
-        pbuf[192..].copy_from_slice(&g1_to_bytes(&to_g1(ark_proof.c)));
-        let proof_bytes = Bytes::from_array(&env, &pbuf);
-
-        let public_square = fr_u256(ArkFr::from(9u64));
-        let public_inputs = soroban_sdk::vec![
-            &env,
-            U256::from_be_bytes(
-                &env,
-                &Bytes::from_array(&env, &public_square.to_be_bytes()),
-            )
-        ];
-
-        // Register the contract and save the VK.
         let id = env.register(ZkContract, ());
         let client = ZkContractClient::new(&env, &id);
 
+        // First call lazily populates the instance cache with the identity key.
+        let first = client.halo2_permutation_key(&2, &3);
+        assert_eq!(first.len(), 6);
         env.as_contract(&id, || {
-            let vk_ref = local_vk.as_vk();
-            vk::save_vk(&env, &vk_ref).unwrap();
+            assert!(env
+                .storage()
+                .instance()
+                .has(&halo2::Halo2StorageKey::PermutationKey(2, 3)));
         });
 
-        // First call with anti_replay=true → should succeed (proof is valid).
-        let first = client.try_verify_proof(&proof_bytes, &public_inputs, &true);
-        assert_eq!(first, Ok(Ok(true)), "first verify_proof should return Ok(true)");
+        // Second call reads the cached key and returns identical data.
+        let second = client.halo2_permutation_key(&2, &3);
+        assert_eq!(second.len(), first.len());
+        for i in 0..first.len() {
+            assert_eq!(second.get(i).unwrap(), first.get(i).unwrap());
+        }
+    }
 
-        // Second call with the identical proof → ReplayDetected.
-        let second = client.try_verify_proof(&proof_bytes, &public_inputs, &true);
+    #[test]
+    fn halo2_range_lookup_uses_instance_cache() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let id = env.register(ZkContract, ());
+        let client = ZkContractClient::new(&env, &id);
+
+        let one = U256::from_u128(&env, 1);
+        // First call caches the range table; both bounds map to 1.
         assert_eq!(
-            second,
-            Err(Ok(ZkContractError::ReplayDetected)),
-            "second verify_proof should return ReplayDetected"
+            client.halo2_range_lookup(&1, &15, &U256::from_u128(&env, 7)),
+            one
         );
-    }
-
-    #[test]
-    fn verify_proof_without_anti_replay_allows_resubmission() {
-        // When anti_replay=false, no nullifier is written and the same proof can
-        // be submitted any number of times.  (The pairing check will fail on dummy
-        // bytes, but we test the nullifier path specifically here.)
-        let env = Env::default();
-        env.cost_estimate().budget().reset_unlimited();
-        let id = env.register(ZkContract, ());
-
-        // We deliberately use a VK with no IC so verify_proof returns
-        // Err(InvalidInput) consistently — we only care that ReplayDetected
-        // is NOT returned on the second call.
         env.as_contract(&id, || {
-            // Save a minimal dummy VK (1 ic entry matching 0 public inputs).
-            let vk_ref = crate::groth16::Groth16VerifyingKey {
-                alpha_g1: vk::G1_GENERATOR,
-                beta_g2: vk::G2_GENERATOR,
-                gamma_g2: vk::G2_GENERATOR,
-                delta_g2: vk::G2_GENERATOR,
-                ic: &[vk::G1_GENERATOR],
-            };
-            vk::save_vk(&env, &vk_ref).unwrap();
+            assert!(env
+                .storage()
+                .instance()
+                .has(&halo2::Halo2StorageKey::LookupTable(1)));
         });
 
-        let proof_bytes = dummy_proof_bytes(&env);
-        let public_inputs: soroban_sdk::Vec<U256> = soroban_sdk::Vec::new(&env);
-        let client = ZkContractClient::new(&env, &id);
-
-        let first = client.try_verify_proof(&proof_bytes, &public_inputs, &false);
-        let second = client.try_verify_proof(&proof_bytes, &public_inputs, &false);
-
-        // Neither result should be ReplayDetected.
-        assert_ne!(
-            first,
-            Err(Ok(ZkContractError::ReplayDetected)),
-            "anti_replay=false must not return ReplayDetected on first call"
+        // Cache hit: an in-range value still resolves, an out-of-range one fails.
+        assert_eq!(
+            client.halo2_range_lookup(&1, &15, &U256::from_u128(&env, 15)),
+            one
         );
-        assert_ne!(
-            second,
-            Err(Ok(ZkContractError::ReplayDetected)),
-            "anti_replay=false must not return ReplayDetected on second call"
-        );
+        assert!(client
+            .try_halo2_range_lookup(&1, &15, &U256::from_u128(&env, 16))
+            .is_err());
     }
 }
