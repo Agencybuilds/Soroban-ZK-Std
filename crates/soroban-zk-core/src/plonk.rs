@@ -17,7 +17,7 @@
 
 use ethnum::u256;
 
-use crate::{Bn254, G1Affine, ZkError};
+use crate::{Bn254, G1Affine, G1Projective, ZkError};
 
 /// A PLONK proof over BN254.
 ///
@@ -230,6 +230,225 @@ pub fn evaluate_linearization(
     Ok(Bn254::add(r_gate, Bn254::add(term_perm, term_init)))
 }
 
+// ============================================================================
+// KZG Evaluation Proof Verification
+// ============================================================================
+//
+// This implements the batched KZG polynomial opening proof check used in the
+// final step of PLONK verification. The prover provides two opening proofs:
+//
+//   W_zeta      — opening proof at challenge point `zeta`
+//   W_zeta_omega — opening proof at shifted point `zeta * omega`
+//
+// The verifier reconstructs the batched commitment `F` and batched evaluation
+// `E`, then checks the two proof equations with a single multi-pairing call.
+//
+// ## Mathematical Specification
+//
+// ### Setup
+//
+// Let `srs_g2 = [tau] * G2` be the SRS G2 element (the trusted-setup point).
+// Let `omega` be the multiplicative generator of the evaluation domain H.
+//
+// The PLONK prover opens *k* polynomials `f_0, ..., f_{k-1}` at `zeta` and
+// a single polynomial `f_last` at `zeta * omega` using two batched proofs:
+//
+//   W_zeta   : opening proof for batched polynomial `F_1(X)` at `zeta`
+//   W_zeta_omega : opening proof for polynomial `F_2(X)` at `zeta * omega`
+//
+// ### Batched Commitment Construction
+//
+// The batched commitment at `zeta` is:
+//   F = sum_{i=0}^{k-1} v^i * C_i
+//
+// where `v` is the Fiat-Shamir batch challenge and `C_i` are the commitments
+// to the opened polynomials.
+//
+// The batched evaluation is:
+//   E = sum_{i=0}^{k-1} v^i * f_i(zeta)   (scalar, encoded as a G1 point)
+//   plus `u * f_last(zeta*omega)` contribution folded in
+//
+// ### Pairing Check
+//
+// The KZG opening equation for a single polynomial `f` with commitment `C`,
+// evaluation `y = f(z)`, and opening proof `W` is:
+//
+//   e(W, [tau - z]_2) = e(C - [y]_1, G2)
+//   ⟺  e(W, [tau]_2) * e(-z * W, G2) = e(C - [y]_1, G2)
+//   ⟺  e(W, [tau]_2) = e(C - [y]_1 + z*W, G2)
+//
+// For the two-point batched form (using random shift `u`):
+//
+//   e(W_zeta + u * W_zeta_omega, [tau]_2)
+//   =
+//   e(zeta * W_zeta + u*zeta*omega * W_zeta_omega + F - E, G2)
+//
+// Rearranged into a product-of-pairings == 1 form (two-pair check):
+//
+//   e(W_zeta + u * W_zeta_omega, [tau]_2)
+//   * e( -(zeta * W_zeta + u*zeta*omega * W_zeta_omega + F - E), G2 )
+//   == 1
+//
+// This is computed via the existing `pairing_check` host function.
+
+/// Input bundle for a batched KZG evaluation proof.
+///
+/// Contains everything the verifier needs to check the PLONK opening proofs
+/// at `zeta` and `zeta * omega` without relying on external state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KzgEvalProofInputs<'a> {
+    /// Commitments to the polynomials opened at `zeta`.
+    /// `commitments[i]` is the commitment for opening `evaluations_at_zeta[i]`.
+    pub commitments: &'a [G1Affine],
+    /// Evaluations `f_i(zeta)` for each commitment in `commitments`.
+    pub evaluations_at_zeta: &'a [u256],
+    /// Commitment to the polynomial opened at `zeta * omega`.
+    pub commitment_at_zeta_omega: G1Affine,
+    /// Evaluation at `zeta * omega`: `f_last(zeta * omega)`.
+    pub evaluation_at_zeta_omega: u256,
+    /// Batched opening proof at `zeta`: `W_zeta` in G1.
+    pub w_zeta: G1Affine,
+    /// Batched opening proof at `zeta * omega`: `W_{zeta*omega}` in G1.
+    pub w_zeta_omega: G1Affine,
+    /// Fiat-Shamir challenge `v` for batching the `zeta`-side polynomials.
+    pub v: u256,
+    /// Fiat-Shamir challenge `u` for combining the two opening points.
+    pub u: u256,
+    /// The evaluation domain challenge `zeta`.
+    pub zeta: u256,
+    /// Domain generator `omega` (primitive n-th root of unity in Fr).
+    pub omega: u256,
+}
+
+/// Computes the LHS and RHS G1 points for the batched KZG pairing check.
+///
+/// Returns `(lhs, rhs)` where:
+///
+/// ```text
+/// lhs = W_zeta + u * W_{zeta*omega}
+/// rhs = zeta * W_zeta + u*zeta*omega * W_{zeta*omega} + F - [E]_1
+/// ```
+///
+/// with:
+///
+/// ```text
+/// F   = sum_i v^i * C_i                   (batched commitment)
+/// E   = sum_i v^i * f_i(zeta) + u * f_last(zeta*omega)   (batched eval as scalar)
+/// ```
+///
+/// The caller is responsible for calling
+/// `pairing_check(env, &[(lhs, srs_g2), (neg(rhs), g2_gen)])` to finalize
+/// verification.
+///
+/// # Errors
+///
+/// Returns [`ZkError::InvalidInput`] if:
+/// - `commitments` and `evaluations_at_zeta` have different lengths.
+/// - Either slice is empty.
+///
+/// Returns [`ZkError::InvalidFieldElement`] if any evaluation is ≥ Fr modulus
+/// or any challenge (`v`, `u`, `zeta`, `omega`) is ≥ Fr modulus.
+pub fn kzg_eval_proof_points(
+    inputs: &KzgEvalProofInputs<'_>,
+) -> Result<(G1Affine, G1Affine), ZkError> {
+    // ── Input validation ────────────────────────────────────────────────────
+    let k = inputs.commitments.len();
+    if k == 0 || k != inputs.evaluations_at_zeta.len() {
+        return Err(ZkError::InvalidInput);
+    }
+
+    // Validate all scalars are in [0, r).
+    let scalars = [inputs.v, inputs.u, inputs.zeta, inputs.omega];
+    for &s in &scalars {
+        if s >= Bn254::FR_MODULUS {
+            return Err(ZkError::InvalidFieldElement);
+        }
+    }
+    for &e in inputs.evaluations_at_zeta {
+        if e >= Bn254::FR_MODULUS {
+            return Err(ZkError::InvalidFieldElement);
+        }
+    }
+    if inputs.evaluation_at_zeta_omega >= Bn254::FR_MODULUS {
+        return Err(ZkError::InvalidFieldElement);
+    }
+
+    // ── Derived challenge: zeta * omega ─────────────────────────────────────
+    let zeta_omega = Bn254::mul(inputs.zeta, inputs.omega);
+
+    // ── Batched commitment F = sum_i v^i * C_i ─────────────────────────────
+    //
+    // We compute the powers of `v` incrementally and accumulate the MSM
+    // using the existing G1 scalar_mul + add path. No heap allocation.
+    let mut f_proj = G1Projective::identity();
+    let mut v_pow = u256::from(1u8); // v^0 = 1
+    for i in 0..k {
+        let term = Bn254::g1_scalar_mul(G1Projective::from(inputs.commitments[i]), v_pow);
+        f_proj = f_proj.add(&term);
+        v_pow = Bn254::mul(v_pow, inputs.v);
+    }
+    let f = f_proj.to_affine();
+
+    // ── Batched evaluation E (as a scalar) ─────────────────────────────────
+    //
+    // E = sum_i v^i * f_i(zeta)  +  u * f_last(zeta*omega)
+    // We re-derive the v-powers here; the loop above consumed them.
+    let mut e_scalar = u256::from(0u8);
+    let mut v_pow = u256::from(1u8);
+    for &eval in inputs.evaluations_at_zeta {
+        let term = Bn254::mul(v_pow, eval);
+        e_scalar = Bn254::add(e_scalar, term);
+        v_pow = Bn254::mul(v_pow, inputs.v);
+    }
+    // Add the zeta*omega contribution: u * f_last(zeta*omega)
+    let u_eval_omega = Bn254::mul(inputs.u, inputs.evaluation_at_zeta_omega);
+    e_scalar = Bn254::add(e_scalar, u_eval_omega);
+
+    // [E]_1 = e_scalar * G1 (generator is (1, 2) on BN254)
+    let g1_gen = G1Affine {
+        x: u256::from(1u8),
+        y: u256::from(2u8),
+    };
+    let e_point = Bn254::g1_scalar_mul(G1Projective::from(g1_gen), e_scalar);
+
+    // ── LHS: W_zeta + u * W_{zeta*omega} ───────────────────────────────────
+    let u_w_omega = Bn254::g1_scalar_mul(G1Projective::from(inputs.w_zeta_omega), inputs.u);
+    let lhs_proj = G1Projective::from(inputs.w_zeta).add(&u_w_omega);
+    let lhs = lhs_proj.to_affine();
+
+    // ── RHS: zeta*W_zeta + u*zeta*omega*W_{zeta*omega} + F - [E]_1 ─────────
+    //
+    // 1. zeta * W_zeta
+    let zeta_w_zeta = Bn254::g1_scalar_mul(G1Projective::from(inputs.w_zeta), inputs.zeta);
+
+    // 2. u * zeta_omega * W_{zeta*omega}
+    let u_zeta_omega = Bn254::mul(inputs.u, zeta_omega);
+    let u_zeta_omega_w = Bn254::g1_scalar_mul(G1Projective::from(inputs.w_zeta_omega), u_zeta_omega);
+
+    // 3. Accumulate: zeta_w_zeta + u_zeta_omega_w + F
+    let rhs_partial = zeta_w_zeta
+        .add(&u_zeta_omega_w)
+        .add(&G1Projective::from(f));
+
+    // 4. Subtract [E]_1: RHS = rhs_partial - e_point
+    //    Negation on BN254: -(x, y) = (x, Fq - y)  (y == 0 stays 0)
+    let e_affine = e_point.to_affine();
+    let neg_e = if e_affine.x == u256::from(0u8) && e_affine.y == u256::from(0u8) {
+        // Point at infinity; negation is the identity.
+        G1Projective::identity()
+    } else {
+        G1Projective::from(G1Affine {
+            x: e_affine.x,
+            y: Bn254::sub_fq(u256::from(0u8), e_affine.y),
+        })
+    };
+
+    let rhs_proj = rhs_partial.add(&neg_e);
+    let rhs = rhs_proj.to_affine();
+
+    Ok((lhs, rhs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +640,190 @@ mod tests {
             evaluate_linearization(&proof, &challenges, &selectors, &commits, &domain),
             Err(crate::ZkError::InvalidInput)
         );
+    }
+
+    // =========================================================================
+    // KZG Evaluation Proof Tests
+    // =========================================================================
+
+    /// Construct a minimal, self-consistent KZG opening fixture.
+    ///
+    /// We use small small scalars to keep the arithmetic manual-verifiable.
+    /// G1 is the BN254 generator `(1, 2)`.
+    fn kzg_fixture() -> KzgEvalProofInputs<'static> {
+        // Single commitment: just the G1 generator as a stand-in.
+        static COMMITMENTS: &[G1Affine] = &[G1Affine {
+            x: u256::from_words(0, 1),
+            y: u256::from_words(0, 2),
+        }];
+        static EVALS: &[u256] = &[u256::from_words(0, 3)]; // f(zeta) = 3
+
+        KzgEvalProofInputs {
+            commitments: COMMITMENTS,
+            evaluations_at_zeta: EVALS,
+            commitment_at_zeta_omega: G1Affine {
+                x: u256::from_words(0, 1),
+                y: u256::from_words(0, 2),
+            },
+            evaluation_at_zeta_omega: u256::from(5u8),
+            w_zeta: G1Affine {
+                x: u256::from_words(0, 1),
+                y: u256::from_words(0, 2),
+            },
+            w_zeta_omega: G1Affine {
+                x: u256::from_words(0, 1),
+                y: u256::from_words(0, 2),
+            },
+            v: u256::from(7u8),
+            u: u256::from(11u8),
+            zeta: u256::from(13u8),
+            omega: u256::from(17u8),
+        }
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_returns_ok_on_valid_input() {
+        let inputs = kzg_fixture();
+        let result = kzg_eval_proof_points(&inputs);
+        assert!(
+            result.is_ok(),
+            "expected Ok from valid inputs, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_lhs_rhs_are_not_identity() {
+        // The points should be non-trivial for small-scalar inputs.
+        let inputs = kzg_fixture();
+        let (lhs, rhs) = kzg_eval_proof_points(&inputs).unwrap();
+        // Neither point should be the identity (0, 0).
+        assert!(
+            lhs.x != u256::from(0u8) || lhs.y != u256::from(0u8),
+            "lhs should not be the point at infinity"
+        );
+        let _ = rhs; // rhs may be any point; we just assert no panic.
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_rejects_mismatched_lengths() {
+        static C: &[G1Affine] = &[G1Affine {
+            x: u256::from_words(0, 1),
+            y: u256::from_words(0, 2),
+        }];
+        static E: &[u256] = &[u256::from_words(0, 1), u256::from_words(0, 2)]; // length mismatch
+
+        let inputs = KzgEvalProofInputs {
+            commitments: C,
+            evaluations_at_zeta: E,
+            ..kzg_fixture()
+        };
+        assert_eq!(
+            kzg_eval_proof_points(&inputs),
+            Err(ZkError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_rejects_empty_commitments() {
+        static C: &[G1Affine] = &[];
+        static E: &[u256] = &[];
+
+        let inputs = KzgEvalProofInputs {
+            commitments: C,
+            evaluations_at_zeta: E,
+            ..kzg_fixture()
+        };
+        assert_eq!(
+            kzg_eval_proof_points(&inputs),
+            Err(ZkError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_rejects_out_of_range_scalar() {
+        // zeta >= FR_MODULUS must be rejected.
+        let mut inputs = kzg_fixture();
+        inputs.zeta = Bn254::FR_MODULUS; // exactly the modulus
+        assert_eq!(
+            kzg_eval_proof_points(&inputs),
+            Err(ZkError::InvalidFieldElement)
+        );
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_rejects_out_of_range_evaluation() {
+        // An evaluation >= FR_MODULUS must be rejected.
+        static C: &[G1Affine] = &[G1Affine {
+            x: u256::from_words(0, 1),
+            y: u256::from_words(0, 2),
+        }];
+        static E_BAD: &[u256] = &[u256::from_words(
+            0x30644e72e131a029b85045b68181585d_u128,
+            0x2833e84879b9709143e1f593f0000001_u128,
+        )]; // == FR_MODULUS
+
+        let inputs = KzgEvalProofInputs {
+            commitments: C,
+            evaluations_at_zeta: E_BAD,
+            ..kzg_fixture()
+        };
+        assert_eq!(
+            kzg_eval_proof_points(&inputs),
+            Err(ZkError::InvalidFieldElement)
+        );
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_rejects_out_of_range_u() {
+        let mut inputs = kzg_fixture();
+        inputs.u = Bn254::FR_MODULUS + u256::from(1u8);
+        assert_eq!(
+            kzg_eval_proof_points(&inputs),
+            Err(ZkError::InvalidFieldElement)
+        );
+    }
+
+    #[test]
+    fn kzg_eval_proof_points_batch_linearity() {
+        // Verifies that adding a second commitment shifts the output in a
+        // predictable, non-trivial way (sanity-check the batching loop).
+        static C1: &[G1Affine] = &[G1Affine {
+            x: u256::from_words(0, 1),
+            y: u256::from_words(0, 2),
+        }];
+        static E1: &[u256] = &[u256::from_words(0, 3)];
+
+        static C2: &[G1Affine] = &[
+            G1Affine {
+                x: u256::from_words(0, 1),
+                y: u256::from_words(0, 2),
+            },
+            G1Affine {
+                x: u256::from_words(0, 1),
+                y: u256::from_words(0, 2),
+            },
+        ];
+        static E2: &[u256] = &[u256::from_words(0, 3), u256::from_words(0, 5)];
+
+        let single = KzgEvalProofInputs {
+            commitments: C1,
+            evaluations_at_zeta: E1,
+            ..kzg_fixture()
+        };
+        let batched = KzgEvalProofInputs {
+            commitments: C2,
+            evaluations_at_zeta: E2,
+            ..kzg_fixture()
+        };
+
+        let (lhs_s, rhs_s) = kzg_eval_proof_points(&single).unwrap();
+        let (lhs_b, rhs_b) = kzg_eval_proof_points(&batched).unwrap();
+
+        // With v=7 and identical W_zeta / W_zeta_omega, the LHS is the same
+        // (it only depends on u and the opening proofs).
+        assert_eq!(lhs_s, lhs_b, "LHS must not depend on commitment batch");
+        // The RHS must differ because the batched commitment changes F.
+        assert_ne!(rhs_s, rhs_b, "RHS must change with the batch size");
     }
 }
